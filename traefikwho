@@ -1,0 +1,4000 @@
+#!/usr/bin/env python3
+"""traefikwho - which Traefik router handles this request, and why did
+the others lose?
+
+A static model of Traefik v3.7's documented file-provider routing
+rules (DESIGN-traefikwho.md, BUILD APPROVED 2026-11-10). Semantics
+pinned to the Traefik reference documentation read 2026-11-10
+(HTTP/TCP Routers Rules & Priority, router/entrypoint references,
+file provider references, v2-to-v3 migration details, v3.4 migration
+notes, 3.6/3.7 release notes). Claims are tagged [documented],
+[docs-inferred], or [hypothesized] in the design; no `traefik`
+binary exists on this box, so no claim here is [observed] and there
+is no live-agreement test: hermetic fixture trees are the only
+oracle, exactly as the documentation text is the only authority.
+
+Pinned semantics (TR01-TR42 in the design doc):
+- TR01 verdict scope is the file provider only. Docker/K8s/Consul/
+  etcd and every other provider are out of scope, bannered, never
+  approximated. A cross-provider reference is UNKNOWN.
+- TR02 two verbs: `http` (request) and `tcp` (connection). No UDP
+  verb (TR33); UDP routers are inventoried, never routed.
+- TR03 rules are parsed by a real tokenizer + recursive-descent
+  parser (`!` > `&&` > `||`), over Go string literals. A rule that
+  fails to parse is a config-fatal.
+- TR04 v3 syntax is the default; v2 is per-router via `ruleSyntax`
+  (or `core.defaultRuleSyntax` in the static file), deprecated.
+- TR05 the HTTP matcher set is closed: eleven matchers. v3 names
+  are `Header`/`HeaderRegexp` (not `Headers`); no `HostHeader`.
+- TR06 Host: lowercase, punycode (non-ASCII is a fatal), `*` one
+  label, `**` one or more, bare `*` catch-all. Port/trailing-dot
+  stripping is [hypothesized], bannered when it changes an outcome.
+- TR07 paths are normalized before matching (v3.4.1: `.`/`..`/
+  duplicate slashes cleaned, `%2F` stays encoded so it never
+  matches a literal `/`).
+- TR08 header names case-insensitive, values exact; any value of a
+  repeated header matches.
+- TR09 Method exact, case-sensitive; unsupplied means UNKNOWN,
+  never a silent GET.
+- TR10 Query one-arg (valueless) vs two-arg; values URL-decoded
+  [hypothesized]; unsupplied key is UNKNOWN.
+- TR11 ClientIP is the direct peer IP, never X-Forwarded-For;
+  CIDR arithmetic on IPv4/IPv6; unsupplied means UNKNOWN.
+- TR12 priority is the rule length as written, with each `**` in a
+  Host/HostSNI wildcard contributing 0 instead of 2. Explicit
+  `priority` overrides; `priority: 0` falls back to length.
+- TR13 three-valued (Kleene) evaluation, then sort, then winner.
+  An UNKNOWN router that could outrank the best TRUE router makes
+  the verdict UNKNOWN, naming the flag that would resolve it.
+- TR14 same-provider priority ties break by router name ascending
+  [hypothesized], bannered on every affected verdict.
+- TR15 entrypoint scoping is a filter before rule evaluation;
+  unsupplied `--entrypoint` makes a listed router UNKNOWN.
+- TR16 TCP routers apply before HTTP routers on a shared
+  entrypoint; a TCP router that could claim the connection makes
+  an `http` verdict UNKNOWN.
+- TR17 TCP matchers: HostSNI (single-level `*` only, no `**`),
+  HostSNIRegexp, ClientIP, ALPN (`ALPN(`ACME-TLS/1`)` is fatal).
+- TR18 a router `tls` block (or entrypoint `http.tls`) makes the
+  router HTTPS-only; router `tls` replaces entrypoint TLS wholesale.
+- TR19 no match is a 404 (exit 1); a match with no servers is a
+  503, still exit 0.
+- TR20 entrypoint redirections happen before routing (REDIRECT,
+  exit 0), except `/.well-known/acme-challenge/`.
+- TR21/TR22 middlewares run after the router matches: declared
+  order, chains expand in place, classified outcome-changing /
+  request-rewriting / response-only-or-opaque.
+- TR23 services are explicit in the file provider (no auto-
+  creation); missing service is a fatal. v3.7 service middlewares
+  print as a second chain after the router chain.
+- TR24 multi-layer routing (`parentRefs`) is refused: those
+  routers are excluded, UNKNOWN if one could win.
+- TR25 duplicate names across files: last file in alphabetical
+  order wins, loser named out loud.
+- TR33/TR35/TR38/TR39/TR40/TR41 as pinned in the design.
+- TR42 v3.8-only fields (`tap`, per-router `respondingTimeouts`)
+  parse but are flagged `[v3.8-only]`; the pin is v3.7 stable.
+
+Stdlib only. No network at runtime. No `traefik` binary is run.
+"""
+
+import ipaddress
+import json
+import os
+import re
+import sys
+
+VERSION = "1.0.0"
+PROG = "traefikwho"
+PINNED_TRAEFIK = "3.7"
+
+MAX_USER_PRIORITY = 9223372036854774807  # MaxInt64 - 1000
+RESERVED_BAND_LOW = MAX_USER_PRIORITY  # (MaxInt-1000, MaxInt]
+
+# ---------------------------------------------------------------- errors
+
+class ConfigFatal(Exception):
+    """A config Traefik would reject (or partly reject): exit 2."""
+
+    def __init__(self, message, where=None):
+        self.message = message
+        self.where = where  # "file:line"
+        super().__init__(message)
+
+
+class UsageError(Exception):
+    """Bad CLI invocation: exit 2."""
+
+
+def fatal(message, where=None):
+    raise ConfigFatal(message, where)
+
+
+# ---------------------------------------------------------------- YAML
+# Minimal YAML subset parser (stdlib only): block mappings/sequences,
+# flow collections, plain/single/double-quoted scalars, block scalars
+# (| and >), comments, anchors/aliases incl. merge key, duplicate-key
+# detection, and a provenance table mapping dotted path tuples to
+# 1-based line numbers. Anything outside the subset is a ConfigFatal
+# naming the line, never a silent misread.
+
+_YAML_BOOL = {
+    "true": True, "True": True, "TRUE": True,
+    "false": False, "False": False, "FALSE": False,
+    "yes": True, "Yes": True, "YES": True,
+    "no": False, "No": False, "NO": False,
+    "on": True, "On": True, "ON": True,
+    "off": False, "Off": False, "OFF": False,
+}
+_YAML_NULL = {"null": None, "Null": None, "NULL": None, "~": None, "": None}
+
+
+def _yaml_scalar(text, line, fname):
+    """Resolve a plain (unquoted) YAML scalar to a Python value."""
+    if text in _YAML_BOOL:
+        return _YAML_BOOL[text]
+    if text in _YAML_NULL:
+        return None
+    if re.fullmatch(r"[-+]?[0-9]+", text):
+        try:
+            return int(text)
+        except ValueError:
+            pass
+    if re.fullmatch(r"0x[0-9a-fA-F]+", text):
+        return int(text, 16)
+    if re.fullmatch(r"0o[0-7]+", text):
+        return int(text, 8)
+    if re.fullmatch(
+            r"[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?", text):
+        try:
+            return float(text)
+        except ValueError:
+            pass
+    if text in (".inf", ".Inf", ".INF", "+.inf", "+.Inf", "+.INF"):
+        return float("inf")
+    if text in ("-.inf", "-.Inf", "-.INF"):
+        return float("-inf")
+    if text in (".nan", ".NaN", ".NAN"):
+        return float("nan")
+    return text
+
+
+def _yaml_double_quoted(text, line, fname):
+    """Parse a double-quoted YAML scalar body (escapes resolved)."""
+    out = []
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\":
+            if i + 1 >= len(text):
+                fatal("dangling escape in double-quoted scalar",
+                      "%s:%d" % (fname, line))
+            e = text[i + 1]
+            simple = {"0": "\0", "a": "\a", "b": "\b", "t": "\t", "\t": "\t",
+                      "n": "\n", "v": "\v", "f": "\f", "r": "\r", "e": "\x1b",
+                      '"': '"', "\\": "\\", "/": "/", " ": " ",
+                      "N": "\x85", "_": "\xa0", "L": "\u2028", "P": "\u2029"}
+            if e in simple:
+                out.append(simple[e])
+                i += 2
+            elif e == "x":
+                out.append(chr(int(text[i + 2:i + 4], 16)))
+                i += 4
+            elif e == "u":
+                out.append(chr(int(text[i + 2:i + 6], 16)))
+                i += 6
+            elif e == "U":
+                out.append(chr(int(text[i + 2:i + 10], 16)))
+                i += 10
+            elif e == "\n":
+                i += 2  # line continuation: backslash-newline folds away
+            else:
+                fatal("unsupported escape \\%s in double-quoted scalar" % e,
+                      "%s:%d" % (fname, line))
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _strip_yaml_comment(line):
+    """Remove a `#` comment: only when `#` starts the line or is
+    preceded by whitespace, and outside any quoted scalar."""
+    in_s = False
+    in_d = False
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if in_s:
+            if c == "'":
+                if i + 1 < len(line) and line[i + 1] == "'":
+                    i += 2
+                    continue
+                in_s = False
+        elif in_d:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_d = False
+        else:
+            if c == "'":
+                in_s = True
+            elif c == '"':
+                in_d = True
+            elif c == "#" and (i == 0 or line[i - 1] in " \t"):
+                return line[:i]
+        i += 1
+    return line
+
+
+def _strip_go_templates_check(text, fname):
+    """True if `{{` appears anywhere in the file text. Traefik
+    evaluates Go templates on the raw file bytes before YAML/TOML
+    parsing, so `{{` inside a quoted rule value is template syntax
+    too (BG1's fixture is exactly that: `{{` in a rule)."""
+    return "{{" in text
+
+
+class _YamlLine:
+    __slots__ = ("no", "indent", "text")
+
+    def __init__(self, no, indent, text):
+        self.no = no
+        self.indent = indent
+        self.text = text
+
+
+class _YamlParser:
+    def __init__(self, text, fname):
+        self.fname = fname
+        self.lines = []
+        for idx, raw in enumerate(text.splitlines(), 1):
+            if "\t" in raw[:len(raw) - len(raw.lstrip())]:
+                fatal("tab character used for indentation (YAML forbids it)",
+                      "%s:%d" % (fname, idx))
+            stripped = _strip_yaml_comment(raw).rstrip()
+            if not stripped.strip():
+                continue
+            indent = len(stripped) - len(stripped.lstrip(" "))
+            content = stripped.strip()
+            if content in ("---", "..."):
+                continue
+            self.lines.append(_YamlLine(idx, indent, content))
+        self.pos = 0
+        self.prov = {}       # path tuple -> 1-based line
+        self.anchors = {}    # name -> value (deep-copied on use)
+
+    # -- low-level helpers ------------------------------------------------
+    def _peek(self):
+        if self.pos < len(self.lines):
+            return self.lines[self.pos]
+        return None
+
+    def _split_key(self, text, line_no):
+        """Split `key: rest` at the first top-level colon. Returns
+        (key, rest, key_is_quoted) or None if there is no key."""
+        in_s = False
+        in_d = False
+        depth = 0
+        i = 0
+        while i < len(text):
+            c = text[i]
+            if in_s:
+                if c == "'":
+                    if i + 1 < len(text) and text[i + 1] == "'":
+                        i += 2
+                        continue
+                    in_s = False
+            elif in_d:
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == '"':
+                    in_d = False
+            else:
+                if c == "'":
+                    in_s = True
+                elif c == '"':
+                    in_d = True
+                elif c in "[{":
+                    depth += 1
+                elif c in "]}":
+                    depth -= 1
+                elif c == ":" and depth == 0:
+                    if i + 1 >= len(text) or text[i + 1] in " \t":
+                        raw_key = text[:i].strip()
+                        rest = text[i + 1:].strip()
+                        return self._parse_key(raw_key, line_no), rest
+            i += 1
+        return None
+
+    def _parse_key(self, raw, line_no):
+        if len(raw) >= 2 and raw[0] == "'" and raw[-1] == "'":
+            return raw[1:-1].replace("''", "'")
+        if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+            return _yaml_double_quoted(raw[1:-1], line_no, self.fname)
+        if not raw or raw[0] in "!&*?|>%@`":
+            fatal("unsupported mapping key %r" % raw,
+                  "%s:%d" % (self.fname, line_no))
+        return raw
+
+    def _parse_scalar_token(self, text, line_no):
+        """Parse one scalar token (plain, single- or double-quoted)."""
+        text = text.strip()
+        if len(text) >= 2 and text[0] == "'" and text[-1] == "'":
+            return text[1:-1].replace("''", "'")
+        if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+            return _yaml_double_quoted(text[1:-1], line_no, self.fname)
+        if text.startswith(("'", '"')):
+            fatal("unterminated quoted scalar", "%s:%d" % (self.fname, line_no))
+        return _yaml_scalar(text, line_no, self.fname)
+
+    # -- flow collections -------------------------------------------------
+    def _flow(self, text, line_no, start=0):
+        """Parse a flow value starting at text[start]; returns
+        (value, next_pos)."""
+        i = start
+        while i < len(text) and text[i] in " \t":
+            i += 1
+        if i >= len(text):
+            fatal("unexpected end of flow collection",
+                  "%s:%d" % (self.fname, line_no))
+        c = text[i]
+        if c == "[":
+            out = []
+            i += 1
+            while True:
+                while i < len(text) and text[i] in " \t":
+                    i += 1
+                if i >= len(text):
+                    fatal("unterminated flow sequence",
+                          "%s:%d" % (self.fname, line_no))
+                if text[i] == "]":
+                    return out, i + 1
+                if text[i] == ",":
+                    i += 1
+                    continue
+                val, i = self._flow(text, line_no, i)
+                out.append(val)
+        if c == "{":
+            out = {}
+            i += 1
+            while True:
+                while i < len(text) and text[i] in " \t":
+                    i += 1
+                if i >= len(text):
+                    fatal("unterminated flow mapping",
+                          "%s:%d" % (self.fname, line_no))
+                if text[i] == "}":
+                    return out, i + 1
+                if text[i] == ",":
+                    i += 1
+                    continue
+                split = self._split_key(text[i:], line_no)
+                if split is None:
+                    fatal("expected key in flow mapping",
+                          "%s:%d" % (self.fname, line_no))
+                key, rest = split
+                if rest:
+                    val, used = self._flow(rest, line_no, 0)
+                    i += (len(text[i:]) - len(rest)) + used
+                else:
+                    # value is the next flow item after the colon
+                    j = i + len(key) + 1
+                    val, j = self._flow(text, line_no, j)
+                    i = j
+                if key in out:
+                    fatal("duplicate key %r in flow mapping" % key,
+                          "%s:%d" % (self.fname, line_no))
+                out[key] = val
+        if c == "'":
+            j = i + 1
+            buf = []
+            while j < len(text):
+                if text[j] == "'":
+                    if j + 1 < len(text) and text[j + 1] == "'":
+                        buf.append("'")
+                        j += 2
+                        continue
+                    return "".join(buf), j + 1
+                buf.append(text[j])
+                j += 1
+            fatal("unterminated single-quoted scalar",
+                  "%s:%d" % (self.fname, line_no))
+        if c == '"':
+            j = i + 1
+            buf = []
+            while j < len(text):
+                if text[j] == "\\":
+                    if j + 1 >= len(text):
+                        break
+                    buf.append(text[j:j + 2])
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    return _yaml_double_quoted("".join(buf), line_no,
+                                                self.fname), j + 1
+                buf.append(text[j])
+                j += 1
+            fatal("unterminated double-quoted scalar",
+                  "%s:%d" % (self.fname, line_no))
+        # plain scalar: up to , ] } at depth 0
+        j = i
+        while j < len(text) and text[j] not in ",]}":
+            j += 1
+        return _yaml_scalar(text[i:j].strip(), line_no, self.fname), j
+
+    def _flow_multiline(self, first, line_no):
+        """A flow collection may span lines; accumulate until the
+        brackets balance (quotes respected)."""
+        text = first
+        depth = 0
+        in_s = in_d = False
+        i = 0
+        while True:
+            i = 0
+            depth = 0
+            in_s = in_d = False
+            while i < len(text):
+                c = text[i]
+                if in_s:
+                    if c == "'":
+                        if i + 1 < len(text) and text[i + 1] == "'":
+                            i += 2
+                            continue
+                        in_s = False
+                elif in_d:
+                    if c == "\\":
+                        i += 2
+                        continue
+                    if c == '"':
+                        in_d = False
+                else:
+                    if c == "'":
+                        in_s = True
+                    elif c == '"':
+                        in_d = True
+                    elif c in "[{":
+                        depth += 1
+                    elif c in "]}":
+                        depth -= 1
+                i += 1
+            if depth <= 0 and not in_s and not in_d:
+                break
+            nxt = self._peek()
+            if nxt is None:
+                fatal("unterminated flow collection",
+                      "%s:%d" % (self.fname, line_no))
+            self.pos += 1
+            text += " " + nxt.text
+        val, _ = self._flow(text, line_no, 0)
+        return val
+
+    # -- block scalars ----------------------------------------------------
+    def _block_scalar(self, header, parent_indent, line_no):
+        """Parse `|`, `>`, with chomping (-/+) and indent digit."""
+        style = header[0]
+        chomp = "clip"
+        extra_indent = 0
+        for ch in header[1:]:
+            if ch == "-":
+                chomp = "strip"
+            elif ch == "+":
+                chomp = "keep"
+            elif ch.isdigit():
+                extra_indent = int(ch)
+            elif ch not in " \t":
+                fatal("unsupported block scalar header %r" % header,
+                      "%s:%d" % (self.fname, line_no))
+        collected = []
+        min_indent = None
+        while True:
+            nxt = self._peek()
+            if nxt is None or nxt.indent <= parent_indent:
+                break
+            if min_indent is None:
+                min_indent = nxt.indent + extra_indent
+            self.pos += 1
+            pad = max(0, nxt.indent - min_indent)
+            collected.append(" " * pad + nxt.text)
+        if style == "|":
+            body = "\n".join(collected)
+        else:  # folded: single newlines become spaces
+            body = ""
+            for idx, ln in enumerate(collected):
+                if idx:
+                    if ln == "" or collected[idx - 1] == "":
+                        body += "\n"
+                    else:
+                        body += " "
+                body += ln
+        if chomp == "clip":
+            body = body + ("\n" if body else "")
+        elif chomp == "keep":
+            body = body + "\n"
+        return body
+
+    # -- anchors ----------------------------------------------------------
+    def _take_anchor(self, text):
+        """Split a leading `&name ` anchor off a value string."""
+        if text.startswith("&"):
+            parts = text.split(None, 1)
+            name = parts[0][1:]
+            if not name:
+                return None, text
+            return name, (parts[1] if len(parts) > 1 else "")
+        return None, text
+
+    def _deepcopy(self, value):
+        if isinstance(value, dict):
+            return {k: self._deepcopy(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._deepcopy(v) for v in value]
+        return value
+
+    # -- the recursive block parser ---------------------------------------
+    def parse(self):
+        if not self.lines:
+            return {}, self.prov
+        value, _ = self._block(self.lines[0].indent, ())
+        return value, self.prov
+
+    def _block(self, indent, path):
+        """Parse one block (mapping, sequence, or scalar) at `indent`."""
+        line = self._peek()
+        if line is None or line.indent < indent:
+            return None, self.pos
+        if line.indent > indent:
+            fatal("unexpected indentation", "%s:%d" % (self.fname, line.no))
+        if line.text == "-" or line.text.startswith("- "):
+            return self._sequence(indent, path)
+        if self._split_key(line.text, line.no) is not None:
+            return self._mapping(indent, path)
+        # bare scalar block (plain scalar, possibly folded)
+        parts = []
+        while True:
+            nxt = self._peek()
+            if nxt is None or nxt.indent < indent:
+                break
+            if nxt.indent == indent and (
+                    nxt.text == "-" or nxt.text.startswith("- ")
+                    or self._split_key(nxt.text, nxt.no) is not None):
+                break
+            self.pos += 1
+            parts.append(nxt.text)
+        return " ".join(parts), self.pos
+
+    def _mapping(self, indent, path):
+        out = {}
+        key_lines = {}
+        while True:
+            line = self._peek()
+            if line is None or line.indent != indent:
+                break
+            if line.text == "-" or line.text.startswith("- "):
+                break
+            split = self._split_key(line.text, line.no)
+            if split is None:
+                break
+            key, rest = split
+            if key in out:
+                fatal("duplicate key %r (first at line %d)"
+                      % (key, key_lines[key]),
+                      "%s:%d" % (self.fname, line.no))
+            key_lines[key] = line.no
+            self.prov[path + (key,)] = line.no
+            self.pos += 1
+            if key == "<<" and rest.startswith("*"):
+                alias = rest[1:].split()[0]
+                if alias not in self.anchors:
+                    fatal("unknown anchor %r" % alias,
+                          "%s:%d" % (self.fname, line.no))
+                merged = self._deepcopy(self.anchors[alias])
+                if not isinstance(merged, dict):
+                    fatal("merge key alias is not a mapping",
+                          "%s:%d" % (self.fname, line.no))
+                for mk, mv in merged.items():
+                    if mk not in out:
+                        out[mk] = mv
+                continue
+            anchor, rest2 = self._take_anchor(rest)
+            value = self._value_after_key(rest2, indent, line, path + (key,))
+            if anchor:
+                self.anchors[anchor] = self._deepcopy(value)
+            out[key] = value
+        return out, self.pos
+
+    def _sequence(self, indent, path):
+        out = []
+        idx = 0
+        while True:
+            line = self._peek()
+            if line is None or line.indent != indent:
+                break
+            if not (line.text == "-" or line.text.startswith("- ")):
+                break
+            self.prov[path + (idx,)] = line.no
+            rest = line.text[1:].strip()
+            item_line = line.no
+            self.pos += 1
+            if rest == "":
+                # nested block on following lines
+                nxt = self._peek()
+                if nxt is not None and nxt.indent > indent:
+                    value, _ = self._block(nxt.indent, path + (idx,))
+                else:
+                    value = None
+            elif rest.startswith(("[", "{")):
+                value = self._flow_multiline(rest, item_line)
+            elif rest[0] in "|>":
+                value = self._block_scalar(rest, indent, item_line)
+            elif rest.startswith("*"):
+                alias = rest[1:].split()[0]
+                if alias not in self.anchors:
+                    fatal("unknown anchor %r" % alias,
+                          "%s:%d" % (self.fname, item_line))
+                value = self._deepcopy(self.anchors[alias])
+            else:
+                anchor, rest2 = self._take_anchor(rest)
+                # An inline `key: value` starts a mapping whose first
+                # line is the remainder; later keys sit at indent+2.
+                split = self._split_key(rest2, item_line)
+                if split is not None:
+                    value = self._inline_map(rest2, indent + 2,
+                                             path + (idx,), item_line)
+                else:
+                    value = self._parse_scalar_token(rest2, item_line)
+                    # plain-scalar continuation lines
+                    cont = []
+                    while True:
+                        nxt = self._peek()
+                        if nxt is None or nxt.indent <= indent:
+                            break
+                        if nxt.text == "-" or nxt.text.startswith("- "):
+                            break
+                        if self._split_key(nxt.text, nxt.no) is not None:
+                            break
+                        self.pos += 1
+                        cont.append(nxt.text)
+                    if cont:
+                        value = str(value) + " " + " ".join(cont)
+                if anchor:
+                    self.anchors[anchor] = self._deepcopy(value)
+            out.append(value)
+            idx += 1
+        return out, self.pos
+
+    def _inline_map(self, first_text, cont_indent, path, first_line):
+        """A mapping whose first `key: value` is inline after `- ` and
+        whose remaining keys are on following lines at cont_indent."""
+        out = {}
+        key_lines = {}
+        text = first_text
+        line_no = first_line
+        first = True
+        while True:
+            split = self._split_key(text, line_no)
+            if split is None:
+                if first:
+                    fatal("expected key: value after '-'",
+                          "%s:%d" % (self.fname, line_no))
+                break
+            key, rest = split
+            if key in out:
+                fatal("duplicate key %r (first at line %d)"
+                      % (key, key_lines[key]),
+                      "%s:%d" % (self.fname, line_no))
+            key_lines[key] = line_no
+            self.prov[path + (key,)] = line_no
+            anchor, rest2 = self._take_anchor(rest)
+            value = self._value_after_key(rest2, cont_indent - 2,
+                                          _YamlLine(line_no, cont_indent - 2,
+                                                    text),
+                                          path + (key,))
+            if anchor:
+                self.anchors[anchor] = self._deepcopy(value)
+            out[key] = value
+            first = False
+            nxt = self._peek()
+            if nxt is None or nxt.indent != cont_indent:
+                break
+            if nxt.text == "-" or nxt.text.startswith("- "):
+                break
+            split2 = self._split_key(nxt.text, nxt.no)
+            if split2 is None:
+                break
+            self.pos += 1
+            text = nxt.text
+            line_no = nxt.no
+        return out
+
+    def _value_after_key(self, rest, key_indent, line, path):
+        """Parse the value part of a `key:` line: an inline value, a
+        nested block, a block scalar, a flow collection, or an alias.
+        `key_indent` is the indent of the `key:` line."""
+        if rest == "":
+            nxt = self._peek()
+            if nxt is None:
+                return None
+            if nxt.indent > key_indent:
+                value, _ = self._block(nxt.indent, path)
+                return value
+            if nxt.indent == key_indent and (
+                    nxt.text == "-" or nxt.text.startswith("- ")):
+                # YAML allows a sequence at the same indent as its key
+                value, _ = self._sequence(key_indent, path)
+                return value
+            return None
+        if rest[0] in "|>":
+            return self._block_scalar(rest, key_indent, line.no)
+        if rest.startswith(("[", "{")):
+            return self._flow_multiline(rest, line.no)
+        if rest.startswith("*"):
+            alias = rest[1:].split()[0]
+            if alias not in self.anchors:
+                fatal("unknown anchor %r" % alias,
+                      "%s:%d" % (self.fname, line.no))
+            return self._deepcopy(self.anchors[alias])
+        # inline scalar, possibly with plain-scalar continuation lines
+        value = self._parse_scalar_token(rest, line.no)
+        if isinstance(value, str):
+            cont = []
+            while True:
+                nxt = self._peek()
+                if nxt is None or nxt.indent <= key_indent:
+                    break
+                if nxt.text == "-" or nxt.text.startswith("- "):
+                    break
+                if self._split_key(nxt.text, nxt.no) is not None:
+                    break
+                self.pos += 1
+                cont.append(nxt.text)
+            if cont:
+                value = value + " " + " ".join(cont)
+        return value
+
+
+def parse_yaml(text, fname):
+    """Parse YAML text -> (data, prov). Raises ConfigFatal."""
+    try:
+        parser = _YamlParser(text, fname)
+        return parser.parse()
+    except ConfigFatal:
+        raise
+    except Exception as exc:  # never leak a bare traceback for bad YAML
+        raise ConfigFatal("unparseable YAML: %s" % exc, fname)
+
+
+# ---------------------------------------------------------------- TOML
+# tomllib (stdlib) does the parsing; a separate line scan supplies the
+# file:line provenance tomllib cannot.
+
+def _toml_line_scan(text, fname):
+    """Map dotted-path tuples to line numbers: table headers
+    `[a.b.c]`, array-table headers `[[a.b.c]]` (indexed), and
+    `key = value` lines under the current table."""
+    prov = {}
+    current = ()
+    array_counts = {}
+    for idx, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"\[\[([^\]]+)\]\]", line)
+        if m:
+            parts = tuple(p.strip() for p in m.group(1).split("."))
+            n = array_counts.get(parts, 0)
+            array_counts[parts] = n + 1
+            current = parts + (n,)
+            prov[parts + (n,)] = idx
+            continue
+        m = re.match(r"\[([^\]]+)\]", line)
+        if m:
+            parts = tuple(p.strip() for p in m.group(1).split("."))
+            current = parts
+            prov[parts] = idx
+            continue
+        m = re.match(r"([A-Za-z0-9_-]+)\s*=", line)
+        if m:
+            prov[current + (m.group(1),)] = idx
+    return prov
+
+
+def parse_toml(text, fname):
+    """Parse TOML text -> (data, prov). Raises ConfigFatal."""
+    import tomllib
+    try:
+        data = tomllib.loads(text)
+    except Exception as exc:
+        raise ConfigFatal("unparseable TOML: %s" % exc, fname)
+    return data, _toml_line_scan(text, fname)
+
+# ---------------------------------------------------------------- rules
+# Tokenizer + recursive-descent parser over the rule grammar (TR03),
+# per-syntax validation (TR04/TR05), priority (TR12/TR36), and
+# three-valued matcher evaluation (TR05-TR11/TR13/TR17).
+
+V3_HTTP_MATCHERS = {
+    "Header": (2, 2), "HeaderRegexp": (2, 2),
+    "Host": (1, 1), "HostRegexp": (1, 1),
+    "Method": (1, 1), "Path": (1, 1), "PathPrefix": (1, 1),
+    "PathRegexp": (1, 1), "Query": (1, 2), "QueryRegexp": (2, 2),
+    "ClientIP": (1, 1),
+}
+V3_TCP_MATCHERS = {
+    "HostSNI": (1, 1), "HostSNIRegexp": (1, 1),
+    "ClientIP": (1, 1), "ALPN": (1, 1),
+}
+# v2 matchers take comma-separated multiple values (OR semantics);
+# Headers/HeadersRegexp/Query take key/value pairs.
+V2_HTTP_MATCHERS = {
+    "Header": (2, 2), "HeaderRegexp": (2, 2),
+    "Headers": (2, None), "HeadersRegexp": (2, None),
+    "Host": (1, None), "HostRegexp": (1, None), "HostHeader": (1, None),
+    "Method": (1, None), "Path": (1, None), "PathPrefix": (1, None),
+    "PathRegexp": (1, None), "Query": (1, None), "QueryRegexp": (2, None),
+    "ClientIP": (1, None),
+}
+V2_TCP_MATCHERS = {
+    "HostSNI": (1, None), "HostSNIRegexp": (1, None),
+    "ClientIP": (1, None), "ALPN": (1, None),
+}
+
+TRUE, FALSE, UNKNOWN = True, False, None
+
+
+def _go_string(rule, i, where):
+    """Parse a Go string literal at rule[i]: backtick or double-quote.
+    Returns (value, next_i). Single quotes are not accepted (TR03)."""
+    if rule[i] == "`":
+        j = rule.find("`", i + 1)
+        if j < 0:
+            fatal("unterminated backtick string in rule", where)
+        return rule[i + 1:j], j + 1
+    if rule[i] == '"':
+        out = []
+        j = i + 1
+        while j < len(rule):
+            c = rule[j]
+            if c == "\\":
+                if j + 1 >= len(rule):
+                    fatal("dangling escape in rule string", where)
+                e = rule[j + 1]
+                simple = {"a": "\a", "b": "\b", "f": "\f", "n": "\n",
+                          "r": "\r", "t": "\t", "v": "\v", "\\": "\\",
+                          '"': '"', "'": "'"}
+                if e in simple:
+                    out.append(simple[e])
+                    j += 2
+                elif e == "x":
+                    try:
+                        out.append(chr(int(rule[j + 2:j + 4], 16)))
+                    except ValueError:
+                        fatal("bad \\x escape in rule string", where)
+                    j += 4
+                elif e == "u":
+                    try:
+                        out.append(chr(int(rule[j + 2:j + 6], 16)))
+                    except ValueError:
+                        fatal("bad \\u escape in rule string", where)
+                    j += 6
+                elif e == "U":
+                    try:
+                        out.append(chr(int(rule[j + 2:j + 10], 16)))
+                    except ValueError:
+                        fatal("bad \\U escape in rule string", where)
+                    j += 10
+                else:
+                    fatal("unsupported escape \\%s in rule string" % e, where)
+            elif c == '"':
+                return "".join(out), j + 1
+            else:
+                out.append(c)
+                j += 1
+        fatal("unterminated double-quoted string in rule", where)
+    fatal("expected a Go string literal (backtick or double-quote) "
+          "in rule; single quotes are not accepted", where)
+
+
+def _tokenize_rule(rule, where):
+    """Token list: (kind, value, offset)."""
+    toks = []
+    i = 0
+    n = len(rule)
+    while i < n:
+        c = rule[i]
+        if c in " \t\r\n":
+            i += 1
+            continue
+        if rule.startswith("&&", i):
+            toks.append(("AND", "&&", i))
+            i += 2
+            continue
+        if rule.startswith("||", i):
+            toks.append(("OR", "||", i))
+            i += 2
+            continue
+        if c == "!":
+            toks.append(("NOT", "!", i))
+            i += 1
+            continue
+        if c == "(":
+            toks.append(("LPAREN", "(", i))
+            i += 1
+            continue
+        if c == ")":
+            toks.append(("RPAREN", ")", i))
+            i += 1
+            continue
+        if c == ",":
+            toks.append(("COMMA", ",", i))
+            i += 1
+            continue
+        if c in "`\"":
+            val, i = _go_string(rule, i, where)
+            toks.append(("STR", val, i))
+            continue
+        if c == "'":
+            fatal("single-quoted matcher values are not accepted in "
+                  "Traefik rules (Go string literals only)", where)
+        if c.isalpha() or c == "_":
+            j = i
+            while j < n and (rule[j].isalnum() or rule[j] == "_"):
+                j += 1
+            toks.append(("IDENT", rule[i:j], i))
+            i = j
+            continue
+        fatal("unexpected character %r in rule at offset %d" % (c, i), where)
+    toks.append(("EOF", None, n))
+    return toks
+
+
+class _RuleParser:
+    def __init__(self, toks, where):
+        self.toks = toks
+        self.i = 0
+        self.where = where
+
+    def peek(self):
+        return self.toks[self.i]
+
+    def next(self):
+        tok = self.toks[self.i]
+        self.i += 1
+        return tok
+
+    def expect(self, kind):
+        tok = self.next()
+        if tok[0] != kind:
+            fatal("expected %s in rule, found %r at offset %d"
+                  % (kind, tok[1], tok[2]), self.where)
+        return tok
+
+    def parse(self):
+        node = self._or()
+        if self.peek()[0] != "EOF":
+            tok = self.peek()
+            fatal("unexpected %r in rule at offset %d" % (tok[1], tok[2]),
+                  self.where)
+        return node
+
+    def _or(self):
+        node = self._and()
+        while self.peek()[0] == "OR":
+            op = self.next()
+            rhs = self._and()
+            node = ("or", node, rhs, op[2])
+        return node
+
+    def _and(self):
+        node = self._not()
+        while self.peek()[0] == "AND":
+            op = self.next()
+            rhs = self._not()
+            node = ("and", node, rhs, op[2])
+        return node
+
+    def _not(self):
+        if self.peek()[0] == "NOT":
+            op = self.next()
+            return ("not", self._not(), op[2])
+        return self._primary()
+
+    def _primary(self):
+        tok = self.peek()
+        if tok[0] == "LPAREN":
+            self.next()
+            node = self._or()
+            self.expect("RPAREN")
+            return node
+        if tok[0] == "IDENT":
+            self.next()
+            self.expect("LPAREN")
+            args = []
+            if self.peek()[0] != "RPAREN":
+                while True:
+                    stok = self.next()
+                    if stok[0] != "STR":
+                        fatal("matcher arguments must be Go string "
+                              "literals, found %r at offset %d"
+                              % (stok[1], stok[2]), self.where)
+                    args.append(stok[1])
+                    if self.peek()[0] == "COMMA":
+                        self.next()
+                        continue
+                    break
+            self.expect("RPAREN")
+            return ("match", tok[1], args, tok[2])
+        fatal("expected a matcher or '(' in rule, found %r at offset %d"
+              % (tok[1], tok[2]), self.where)
+
+
+def parse_rule(rule, where):
+    """Parse a rule string into an AST. Raises ConfigFatal."""
+    if not isinstance(rule, str) or rule.strip() == "":
+        fatal("router has an empty rule", where)
+    return _RuleParser(_tokenize_rule(rule, where), where).parse()
+
+
+def _v2_capture_to_regex(pattern):
+    """Convert v2 `{name:pattern}` captures to plain regex groups.
+    The binding is never used for routing; only the match matters."""
+    out = []
+    i = 0
+    while i < len(pattern):
+        if pattern[i] == "{":
+            j = pattern.find("}", i)
+            if j < 0:
+                return None  # unbalanced brace: not a valid capture
+            inner = pattern[i + 1:j]
+            if ":" in inner:
+                name, pat = inner.split(":", 1)
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name or ""):
+                    out.append("(?P<%s>%s)" % (name, pat))
+                    i = j + 1
+                    continue
+            return None
+        out.append(pattern[i])
+        i += 1
+    return "".join(out)
+
+
+def _check_ascii_host(value, where, matcher):
+    if any(ord(ch) > 127 for ch in value):
+        fatal("%s value %r contains non-ASCII characters; use punycode"
+              % (matcher, value), where)
+
+
+def _check_client_ip(value, where):
+    try:
+        return ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        try:
+            addr = ipaddress.ip_address(value)
+        except ValueError:
+            fatal("malformed IP/CIDR %r in ClientIP" % value, where)
+        return ipaddress.ip_network(addr)
+
+
+def _check_method(value, where):
+    if not re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", value):
+        fatal("Method value %r is not a valid HTTP token" % value, where)
+
+
+def _compile_regex(pattern, where, matcher):
+    try:
+        return re.compile(pattern)
+    except re.error as exc:
+        fatal("%s regex %r cannot be compiled by this tool: %s"
+              % (matcher, pattern, exc), where)
+
+
+def validate_rule(ast, syntax, kind, where, findings):
+    """Validate a parsed rule against the resolved syntax (TR04/TR05).
+    Returns a dict of matcher-name -> compiled helpers used at eval
+    time (regexes, networks). Raises ConfigFatal on violations."""
+    if syntax == "v3":
+        table = V3_HTTP_MATCHERS if kind == "http" else V3_TCP_MATCHERS
+    else:
+        table = V2_HTTP_MATCHERS if kind == "http" else V2_TCP_MATCHERS
+    compiled = {}
+
+    def walk(node):
+        tag = node[0]
+        if tag in ("and", "or"):
+            walk(node[1])
+            walk(node[2])
+        elif tag == "not":
+            walk(node[1])
+        elif tag == "match":
+            _, name, args, _off = node
+            if name not in table:
+                if syntax == "v3":
+                    fatal("unknown matcher %s in v3 rule "
+                          "(Headers/HostHeader do not exist in v3; "
+                          "did you mean Header?)" % name, where)
+                fatal("unknown matcher %s in %s rule" % (name, syntax), where)
+            lo, hi = table[name]
+            if len(args) < lo or (hi is not None and len(args) > hi):
+                fatal("%s takes %s argument(s) in %s syntax, got %d"
+                      % (name,
+                         ("%d" % lo) if lo == hi else ("%d-%d" % (lo, hi)),
+                         syntax, len(args)), where)
+            if syntax == "v2" and name in ("Headers", "HeadersRegexp"):
+                if len(args) % 2 != 0:
+                    fatal("v2 %s takes key/value pairs, got %d arguments"
+                          % (name, len(args)), where)
+            if syntax == "v2" and name in ("Query", "QueryRegexp"):
+                if len(args) % 2 != 0:
+                    fatal("v2 %s takes key/value pairs, got %d arguments"
+                          % (name, len(args)), where)
+            key = (name, tuple(args))
+            if key in compiled:
+                return
+            if name in ("Host", "HostHeader"):
+                for v in args:
+                    _check_ascii_host(v, where, name)
+                    if syntax == "v2" and ("*" in v):
+                        fatal("wildcard Host %r is not available in v2 "
+                              "syntax" % v, where)
+            elif name == "HostRegexp":
+                for v in args:
+                    _check_ascii_host(v, where, name)
+                    compiled[key] = _compile_regex(v, where, name)
+                    if re.search(r"[A-Z]", re.sub(r"\[[^\]]*\]", "", v)):
+                        findings.append(
+                            "[hostregexp-case-never-matches] %s %r "
+                            "contains an uppercase literal outside a "
+                            "character class, but HostRegexp is applied "
+                            "to a lowercased host" % (name, v))
+            elif name in ("Path", "PathPrefix"):
+                for v in args:
+                    if not v.startswith("/"):
+                        fatal("%s value %r must start with '/'" % (name, v),
+                              where)
+                    if syntax == "v3" and "{" in v:
+                        findings.append(
+                            "note: %s %r contains a {name} placeholder, "
+                            "which is a literal in v3 syntax and never "
+                            "matches a parameterized path; use PathRegexp"
+                            % (name, v))
+                    if syntax == "v2":
+                        rx = _v2_capture_to_regex(v)
+                        if rx is not None:
+                            compiled[key] = _compile_regex(
+                                "^" + rx + ("$" if name == "Path" else ""),
+                                where, name)
+            elif name == "PathRegexp":
+                for v in args:
+                    compiled[key] = _compile_regex(v, where, name)
+            elif name == "HeaderRegexp":
+                compiled[key] = _compile_regex(args[1], where, name)
+            elif name == "QueryRegexp":
+                compiled[key] = _compile_regex(args[1], where, name)
+            elif name == "HostSNI":
+                for v in args:
+                    _check_ascii_host(v, where, name)
+                    if syntax == "v3" and v.startswith("**."):
+                        fatal("HostSNI does not support the ** multi-level "
+                              "wildcard (single-level * only)", where)
+                    if syntax == "v2" and ("*" in v):
+                        fatal("wildcard HostSNI %r is not available in v2 "
+                              "syntax" % v, where)
+            elif name == "HostSNIRegexp":
+                for v in args:
+                    compiled[key] = _compile_regex(v, where, name)
+            elif name == "ClientIP":
+                compiled[key] = [_check_client_ip(v, where) for v in args]
+            elif name == "Method":
+                for v in args:
+                    _check_method(v, where)
+            elif name == "ALPN":
+                for v in args:
+                    if v == "ACME-TLS/1":
+                        fatal("ALPN(`ACME-TLS/1`) is forbidden: Traefik "
+                              "returns an error for it", where)
+    walk(ast)
+    return compiled
+
+
+def rule_priority(rule, ast, syntax):
+    """TR12/TR36: len(rule as written) minus 2 per `**` inside a
+    v3 Host/HostSNI wildcard argument."""
+    length = len(rule)
+    if syntax == "v3":
+        def walk(node):
+            nonlocal length
+            tag = node[0]
+            if tag in ("and", "or"):
+                walk(node[1])
+                walk(node[2])
+            elif tag == "not":
+                walk(node[1])
+            elif tag == "match" and node[1] in ("Host", "HostSNI"):
+                for arg in node[2]:
+                    length -= 2 * arg.count("**")
+        walk(ast)
+    return length
+
+
+# ---------------------------------------------------------------- facts
+
+def normalize_path(raw):
+    """TR07: RFC 3986 dot-segment removal + duplicate-slash collapse
+    on the still-percent-encoded path; `%2F` stays encoded so it
+    never matches a literal `/` in a Path/PathPrefix value. A
+    trailing slash is preserved: the docs pin that Path(`/products`)
+    does not match `/products/`, so `/products/` must not collapse
+    to `/products`."""
+    if raw == "":
+        return "/"
+    path = raw.split("?", 1)[0]
+    if not path.startswith("/"):
+        path = "/" + path
+    trailing = path.endswith("/") and len(path) > 1
+    out = []
+    for seg in path.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if out:
+                out.pop()
+            continue
+        out.append(seg)
+    result = "/" + "/".join(out)
+    if trailing and result != "/":
+        result += "/"
+    return result if result else "/"
+
+
+def split_path_query(raw):
+    """Split `--path` at the first `?`; returns (path, query-dict of
+    lists, decoded per TR10 [hypothesized])."""
+    from urllib.parse import parse_qsl, unquote_plus
+    if "?" not in raw:
+        return raw, {}
+    path, qs = raw.split("?", 1)
+    multi = {}
+    for k, v in parse_qsl(qs, keep_blank_values=True):
+        multi.setdefault(unquote_plus(k), []).append(unquote_plus(v))
+    return path, multi
+
+
+def normalize_host(raw):
+    """TR06: lowercase; strip `:port` and a trailing dot
+    [hypothesized]. Returns (normalized, stripped_anything)."""
+    host = raw.strip().lower()
+    changed = False
+    if host.startswith("["):
+        end = host.find("]")
+        if end >= 0:
+            rest = host[end + 1:]
+            if rest.startswith(":") and rest[1:].isdigit():
+                host = host[:end + 1]
+                changed = True
+    elif ":" in host:
+        head, sep, tail = host.rpartition(":")
+        if tail.isdigit() and head:
+            host = head
+            changed = True
+    if host.endswith("."):
+        host = host.rstrip(".")
+        changed = True
+    return host, changed
+
+
+def _host_match(pattern, host):
+    """pattern/host are already lowercased. `*` one label, `**` one
+    or more, bare `*` catch-all (TR06)."""
+    if pattern == "*":
+        return True
+    if pattern.startswith("**."):
+        suffix = pattern[3:]
+        return host.endswith("." + suffix)
+    if pattern.startswith("*."):
+        suffix = pattern[2:]
+        if not host.endswith("." + suffix):
+            return False
+        prefix = host[:-(len(suffix) + 1)]
+        return bool(prefix) and "." not in prefix
+    return host == pattern
+
+
+class HttpFacts:
+    def __init__(self, host=None, path="/", method=None, headers=None,
+                 query=None, client_ip=None, entrypoint=None, tls=None):
+        self.host_raw = host
+        self.host = None
+        self.host_stripped = False
+        if host is not None:
+            self.host, self.host_stripped = normalize_host(host)
+        self.path_raw = path
+        self.path = normalize_path(path)
+        _p, q_from_path = split_path_query(path)
+        self.path = normalize_path(_p)
+        self.method = method
+        self.headers = {}
+        for k, vals in (headers or {}).items():
+            self.headers[k.lower()] = list(vals)
+        self.query = {}
+        for k, vals in q_from_path.items():
+            self.query[k] = list(vals)
+        for k, vals in (query or {}).items():
+            self.query[k] = list(vals)  # explicit --query wins (TR07)
+        self.client_ip_raw = client_ip
+        self.client_ip = None
+        if client_ip is not None:
+            try:
+                self.client_ip = ipaddress.ip_address(client_ip)
+            except ValueError:
+                raise UsageError("--client-ip %r is not a valid IP address"
+                                 % client_ip)
+        self.entrypoint = entrypoint
+        self.tls = tls
+        self.router_has_tls = True  # True / False / None (unsupplied)
+        # The http verb carries no SNI/ALPN: always UNKNOWN for TCP
+        # rules evaluated by the TCP-before-HTTP gate (TR16).
+        self.sni = None
+        self.alpn = None
+        self.router_has_tls = True
+
+    def host_would_match_raw(self, pattern):
+        """Did the port/dot strip change this Host outcome?"""
+        if self.host_raw is None:
+            return False
+        raw_lower = self.host_raw.strip().lower()
+        return _host_match(pattern, self.host) and not _host_match(
+            pattern, raw_lower)
+
+
+class TcpFacts:
+    def __init__(self, sni=None, alpn=None, client_ip=None,
+                 entrypoint=None, tls=None):
+        self.sni_raw = sni
+        self.sni = None
+        self.sni_stripped = False
+        if sni is not None:
+            self.sni, self.sni_stripped = normalize_host(sni)
+        self.alpn = alpn
+        self.client_ip_raw = client_ip
+        self.client_ip = None
+        if client_ip is not None:
+            try:
+                self.client_ip = ipaddress.ip_address(client_ip)
+            except ValueError:
+                raise UsageError("--client-ip %r is not a valid IP address"
+                                 % client_ip)
+        self.entrypoint = entrypoint
+        self.tls = tls
+
+
+def _kleene_and(a, b):
+    if a is FALSE or b is FALSE:
+        return FALSE
+    if a is TRUE and b is TRUE:
+        return TRUE
+    return UNKNOWN
+
+
+def _kleene_or(a, b):
+    if a is TRUE or b is TRUE:
+        return TRUE
+    if a is FALSE and b is FALSE:
+        return FALSE
+    return UNKNOWN
+
+
+def _ip_in_networks(ip, networks):
+    if ip is None:
+        return UNKNOWN
+    cand = [ip]
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        cand.append(ip.ipv4_mapped)  # [hypothesized] (TR11)
+    for net in networks:
+        for c in cand:
+            try:
+                if c.version == net.version and c in net:
+                    return TRUE
+            except TypeError:
+                continue
+    return FALSE
+
+
+def _eval_match(name, args, facts, compiled, kind, where):
+    """Evaluate one matcher term -> (value, reason, missing_flag)."""
+    key = (name, tuple(args))
+    if name in ("Host", "HostHeader"):
+        if facts.host is None:
+            if any(a == "*" for a in args):
+                return TRUE, "Host(`*`) matches a hostless request", None
+            return UNKNOWN, "%s UNKNOWN (no --host supplied)" % name, "--host"
+        for v in args:
+            if _host_match(v.lower(), facts.host):
+                reason = "%s(`%s`) matches host %s" % (name, v, facts.host)
+                if facts.host_stripped and facts.host_would_match_raw(
+                        v.lower()):
+                    reason += " [host-port-stripped-hypothesis]"
+                return TRUE, reason, None
+        return FALSE, "%s(%s) does not match host %s" % (
+            name, ", ".join("`%s`" % a for a in args), facts.host), None
+    if name == "HostRegexp":
+        if facts.host is None:
+            return UNKNOWN, "HostRegexp UNKNOWN (no --host supplied)", "--host"
+        rx = compiled[key]
+        if rx.search(facts.host):
+            return TRUE, "HostRegexp(`%s`) matches host %s" % (
+                args[0], facts.host), None
+        return FALSE, "HostRegexp(`%s`) does not match host %s" % (
+            args[0], facts.host), None
+    if name == "Method":
+        if facts.method is None:
+            return UNKNOWN, "Method UNKNOWN (no --method supplied)", "--method"
+        for v in args:
+            if facts.method == v:
+                return TRUE, "Method(`%s`) matches" % v, None
+        return FALSE, "Method is %s, not %s" % (
+            facts.method, "/".join("`%s`" % a for a in args)), None
+    if name == "Path":
+        if key in compiled:  # v2 regex form
+            if compiled[key].search(facts.path):
+                return TRUE, "Path(`%s`) matches path %s" % (
+                    args[0], facts.path), None
+            return FALSE, "Path(`%s`) does not match path %s" % (
+                args[0], facts.path), None
+        for v in args:
+            if facts.path == v:
+                return TRUE, "Path(`%s`) matches path %s" % (v, facts.path), None
+        return FALSE, "Path is %s" % facts.path, None
+    if name == "PathPrefix":
+        if key in compiled:  # v2 regex form
+            if compiled[key].search(facts.path):
+                return TRUE, "PathPrefix(`%s`) matches path %s" % (
+                    args[0], facts.path), None
+            return FALSE, "PathPrefix(`%s`) does not match path %s" % (
+                args[0], facts.path), None
+        for v in args:
+            if facts.path.startswith(v):
+                return TRUE, "PathPrefix(`%s`) matches path %s" % (
+                    v, facts.path), None
+        return FALSE, "Path %s has no prefix %s" % (
+            facts.path, "/".join("`%s`" % a for a in args)), None
+    if name == "PathRegexp":
+        rx = compiled[key]
+        if rx.search(facts.path):
+            return TRUE, "PathRegexp(`%s`) matches path %s" % (
+                args[0], facts.path), None
+        return FALSE, "PathRegexp(`%s`) does not match path %s" % (
+            args[0], facts.path), None
+    if name in ("Header", "Headers"):
+        pairs = [(args[i], args[i + 1]) for i in range(0, len(args), 2)] \
+            if name == "Headers" else [(args[0], args[1])]
+        for hk, hv in pairs:
+            vals = facts.headers.get(hk.lower())
+            if vals is None:
+                return UNKNOWN, (
+                    "Header `%s` UNKNOWN (not supplied; "
+                    "use --header %s=...)" % (hk, hk)), "--header"
+            if any(v == hv for v in vals):
+                return TRUE, "Header(`%s`, `%s`) matches" % (hk, hv), None
+        return FALSE, "Header %s is not %s" % (
+            pairs[0][0], pairs[0][1]), None
+    if name in ("HeaderRegexp", "HeadersRegexp"):
+        pairs = [(args[i], args[i + 1]) for i in range(0, len(args), 2)] \
+            if name == "HeadersRegexp" else [(args[0], args[1])]
+        for hk, _ in pairs:
+            vals = facts.headers.get(hk.lower())
+            if vals is None:
+                return UNKNOWN, "HeaderRegexp `%s` UNKNOWN (not supplied)" % hk, "--header"
+        rx = compiled[key]
+        for hk, _hv in pairs:
+            for v in facts.headers.get(hk.lower(), []):
+                if rx.search(v):
+                    return TRUE, "HeaderRegexp(`%s`, `%s`) matches" % (
+                        hk, args[1]), None
+        return FALSE, "HeaderRegexp(`%s`, `%s`) does not match" % (
+            pairs[0][0], args[1]), None
+    if name == "Query":
+        if len(args) == 1:
+            vals = facts.query.get(args[0])
+            if vals is None:
+                return UNKNOWN, (
+                    "Query `%s` UNKNOWN (not supplied; "
+                    "use --query %s=...)" % (args[0], args[0])), "--query"
+            return TRUE, "Query(`%s`) present" % args[0], None
+        pairs = [(args[i], args[i + 1]) for i in range(0, len(args), 2)]
+        for qk, qv in pairs:
+            vals = facts.query.get(qk)
+            if vals is None:
+                return UNKNOWN, "Query `%s` UNKNOWN (not supplied)" % qk, "--query"
+            if any(v == qv for v in vals):
+                return TRUE, "Query(`%s`, `%s`) matches" % (qk, qv), None
+        return FALSE, "Query %s is not %s" % (pairs[0][0], pairs[0][1]), None
+    if name == "QueryRegexp":
+        pairs = [(args[i], args[i + 1]) for i in range(0, len(args), 2)]
+        for qk, _ in pairs:
+            if facts.query.get(qk) is None:
+                return UNKNOWN, "QueryRegexp `%s` UNKNOWN (not supplied)" % qk, "--query"
+        rx = compiled[key]
+        for qk, _ in pairs:
+            for v in facts.query.get(qk, []):
+                if rx.search(v):
+                    return TRUE, "QueryRegexp(`%s`, `%s`) matches" % (
+                        qk, args[1]), None
+        return FALSE, "QueryRegexp(`%s`, `%s`) does not match" % (
+            pairs[0][0], args[1]), None
+    if name == "ClientIP":
+        nets = compiled[key]
+        val = _ip_in_networks(facts.client_ip, nets)
+        if val is UNKNOWN:
+            return UNKNOWN, "ClientIP UNKNOWN (no --client-ip supplied)", "--client-ip"
+        if val is TRUE:
+            return TRUE, "ClientIP(`%s`) matches %s" % (
+                args[0], facts.client_ip_raw), None
+        return FALSE, "ClientIP %s is not in %s" % (
+            facts.client_ip_raw, ", ".join("`%s`" % a for a in args)), None
+    if name == "HostSNI":
+        # TR17: only TLS routers can see SNI. A router with no tls
+        # block can never match a non-`*` HostSNI term (on a non-TLS
+        # connection it is FALSE by the docs; on a TLS connection it
+        # cannot read the ClientHello without TLS).
+        if not getattr(facts, "router_has_tls", True):
+            if any(a == "*" for a in args):
+                return TRUE, "HostSNI(`*`) matches any connection", None
+            return FALSE, ("HostSNI needs a TLS router; this router has "
+                           "no tls block"), None
+        if facts.tls is FALSE:
+            if any(a == "*" for a in args):
+                return TRUE, "HostSNI(`*`) matches a non-TLS connection", None
+            return FALSE, "HostSNI needs TLS; connection is plain (--no-tls)", None
+        if facts.sni is None:
+            if any(a == "*" for a in args):
+                return TRUE, "HostSNI(`*`) matches any connection", None
+            return UNKNOWN, ("HostSNI UNKNOWN (TLS state/SNI not supplied; "
+                             "use --tls/--no-tls and --sni)"), "--sni"
+        for v in args:
+            if _host_match(v.lower(), facts.sni):
+                return TRUE, "HostSNI(`%s`) matches SNI %s" % (v, facts.sni), None
+        return FALSE, "HostSNI does not match SNI %s" % facts.sni, None
+    if name == "HostSNIRegexp":
+        if not getattr(facts, "router_has_tls", True):
+            return FALSE, ("HostSNIRegexp needs a TLS router; this router "
+                          "has no tls block"), None
+        if facts.tls is FALSE:
+            return FALSE, "HostSNIRegexp needs TLS; connection is plain", None
+        if facts.sni is None:
+            return UNKNOWN, "HostSNIRegexp UNKNOWN (SNI not supplied)", "--sni"
+        rx = compiled[key]
+        if rx.search(facts.sni):
+            return TRUE, "HostSNIRegexp(`%s`) matches SNI %s" % (
+                args[0], facts.sni), None
+        return FALSE, "HostSNIRegexp(`%s`) does not match SNI %s" % (
+            args[0], facts.sni), None
+    if name == "ALPN":
+        if facts.alpn is None:
+            return UNKNOWN, "ALPN UNKNOWN (no --alpn supplied)", "--alpn"
+        for v in args:
+            if facts.alpn == v:
+                return TRUE, "ALPN(`%s`) matches" % v, None
+        return FALSE, "ALPN is %s" % facts.alpn, None
+    return UNKNOWN, "matcher %s not evaluable in this build" % name, None
+
+
+def eval_rule(node, facts, compiled, kind, where):
+    """Three-valued evaluation -> (value, deciding_reasons).
+    deciding_reasons are the leaf reasons that determined the value."""
+    tag = node[0]
+    if tag == "and":
+        lv, lr = eval_rule(node[1], facts, compiled, kind, where)
+        rv, rr = eval_rule(node[2], facts, compiled, kind, where)
+        val = _kleene_and(lv, rv)
+        if val is FALSE:
+            return FALSE, (lr if lv is FALSE else rr)
+        if val is TRUE:
+            return TRUE, lr + rr
+        return UNKNOWN, (lr if lv is UNKNOWN else []) + \
+            (rr if rv is UNKNOWN else [])
+    if tag == "or":
+        lv, lr = eval_rule(node[1], facts, compiled, kind, where)
+        rv, rr = eval_rule(node[2], facts, compiled, kind, where)
+        val = _kleene_or(lv, rv)
+        if val is TRUE:
+            return TRUE, (lr if lv is TRUE else rr)
+        if val is FALSE:
+            return FALSE, lr + rr
+        return UNKNOWN, (lr if lv is UNKNOWN else []) + \
+            (rr if rv is UNKNOWN else [])
+    if tag == "not":
+        v, r = eval_rule(node[1], facts, compiled, kind, where)
+        if v is UNKNOWN:
+            return UNKNOWN, r
+        return (not v), r
+    # leaf matcher
+    _, name, args, _off = node
+    val, reason, _flag = _eval_match(name, args, facts, compiled, kind, where)
+    return val, [reason]
+
+
+def missing_flags_for(node, facts, compiled, kind, where):
+    """Flags that would resolve an UNKNOWN rule (TR13)."""
+    flags = []
+
+    def walk(n):
+        tag = n[0]
+        if tag in ("and", "or"):
+            walk(n[1])
+            walk(n[2])
+        elif tag == "not":
+            walk(n[1])
+        elif tag == "match":
+            _, name, args, _o = n
+            _v, _r, flag = _eval_match(name, args, facts, compiled,
+                                       kind, where)
+            if flag and flag not in flags:
+                flags.append(flag)
+    walk(node)
+    return flags
+
+# ---------------------------------------------------------------- model
+# Config model: routers / services / middlewares / TLS objects with
+# file:line provenance, merged across files (TR25 last-file-wins),
+# plus the static file (entrypoints, defaultRuleSyntax, providers).
+
+KNOWN_PROVIDERS = {
+    "file", "docker", "kubernetes", "kubernetes-ingress",
+    "kubernetes-crd", "kubernetescrd", "kubernetesingress",
+    "consul", "consulcatalog", "etcd", "zookeeper", "rancher",
+    "nomad", "ecs", "http", "internal", "traefik",
+}
+NON_FILE_PROVIDERS = KNOWN_PROVIDERS - {"file", "internal", "traefik"}
+
+HTTP_BUILTIN_MIDDLEWARES = {
+    "AddPrefix", "BasicAuth", "Buffering", "Chain", "CircuitBreaker",
+    "Compress", "ContentType", "DigestAuth", "Errors", "ForwardAuth",
+    "GrpcWeb", "Headers", "IPAllowList", "InFlightReq",
+    "PassTLSClientCert", "RateLimit", "RedirectRegex", "RedirectScheme",
+    "ReplacePath", "ReplacePathRegex", "Retry", "StripPort",
+    "StripPrefix", "StripPrefixRegex",
+}
+TCP_BUILTIN_MIDDLEWARES = {"InFlightConn", "IPAllowList"}
+V38_ONLY_MIDDLEWARES = {"Tap"}
+
+# Traefik config files spell middleware types in lowerCamelCase
+# (stripPrefix, basicAuth, ...); the docs' overview table uses
+# PascalCase. Normalize at load time so classification, chain
+# expansion, and display all use one spelling.
+_MW_TYPE_ALIASES = {
+    "addPrefix": "AddPrefix", "basicAuth": "BasicAuth",
+    "buffering": "Buffering", "chain": "Chain",
+    "circuitBreaker": "CircuitBreaker", "compress": "Compress",
+    "contentType": "ContentType", "digestAuth": "DigestAuth",
+    "errors": "Errors", "forwardAuth": "ForwardAuth",
+    "grpcWeb": "GrpcWeb", "headers": "Headers",
+    "ipAllowList": "IPAllowList", "inFlightReq": "InFlightReq",
+    "passTLSClientCert": "PassTLSClientCert", "rateLimit": "RateLimit",
+    "redirectRegex": "RedirectRegex", "redirectScheme": "RedirectScheme",
+    "replacePath": "ReplacePath", "replacePathRegex": "ReplacePathRegex",
+    "retry": "Retry", "stripPort": "StripPort",
+    "stripPrefix": "StripPrefix", "stripPrefixRegex": "StripPrefixRegex",
+    "tap": "Tap", "inFlightConn": "InFlightConn",
+}
+
+
+def normalize_middleware_type(raw):
+    return _MW_TYPE_ALIASES.get(raw, raw)
+
+
+def split_provider_ref(ref, where, what):
+    """Split `name@provider` -> (name, provider). Bare name means the
+    file provider. An unknown provider suffix is a config-fatal."""
+    if "@" in ref:
+        name, provider = ref.rsplit("@", 1)
+        if provider not in KNOWN_PROVIDERS:
+            fatal("%s reference %r names unknown provider %r"
+                  % (what, ref, provider), where)
+        if provider == "traefik":
+            provider = "internal"
+        return name, provider
+    return ref, "file"
+
+
+class Router:
+    def __init__(self, name, kind, fname, line):
+        self.name = name
+        self.kind = kind  # http | tcp | udp
+        self.file = fname
+        self.line = line
+        self.where = "%s:%d" % (fname, line)
+        self.rule = None
+        self.rule_line = None
+        self.ast = None
+        self.compiled = {}
+        self.syntax = "v3"
+        self.priority = None
+        self.explicit_priority = None
+        self.entrypoints = None  # None = all
+        self.service_ref = None
+        self.service_line = None
+        self.middleware_refs = []
+        self.tls = None        # dict | None (present = HTTPS-only)
+        self.tls_line = None
+        self.parent_refs = None
+        self.responding_timeouts = None
+        self.observability = None
+        self.is_internal = False
+        self.templated = False
+
+    def label(self):
+        return "%s@file" % self.name
+
+
+class Service:
+    def __init__(self, name, kind, fname, line):
+        self.name = name
+        self.kind = kind
+        self.file = fname
+        self.line = line
+        self.where = "%s:%d" % (fname, line)
+        self.type = None       # loadBalancer | weighted | mirroring | failover
+        self.data = {}
+        self.middlewares = []  # service middlewares (v3.7, TR23)
+        self.templated = False
+
+
+class Middleware:
+    def __init__(self, name, fname, line):
+        self.name = name
+        self.file = fname
+        self.line = line
+        self.where = "%s:%d" % (fname, line)
+        self.type = None
+        self.config = {}
+        self.templated = False
+
+
+class TlsOption:
+    def __init__(self, name, fname, line):
+        self.name = name
+        self.file = fname
+        self.line = line
+        self.data = {}
+
+
+class StaticConfig:
+    def __init__(self):
+        self.file = None
+        self.entrypoints = {}   # name -> dict
+        self.default_rule_syntax = None
+        self.providers = {}     # provider name -> config (presence = enabled)
+        self.precedence = None
+        self.api_enabled = False
+        self.api_entrypoints = None
+        self.cert_resolvers = set()
+        self.has_tls_certs = False
+
+
+class LoadedConfig:
+    def __init__(self):
+        self.files = []          # (path, kind) in load order
+        self.ignored_files = []  # (path, reason)
+        self.routers = {}        # name -> Router (http+tcp+udp share ns? no)
+        self.http_routers = {}
+        self.tcp_routers = {}
+        self.udp_routers = {}
+        self.services = {}       # (kind, name) -> Service
+        self.middlewares = {}    # name -> Middleware (http+tcp share ns)
+        self.tls_options = {}    # name -> TlsOption
+        self.tls_certs = []      # (certFile, keyFile, where)
+        self.static = StaticConfig()
+        self.findings = []       # banner strings, in discovery order
+        self.templated_files = []
+        self.shadow_findings = []
+        self.duplicate_findings = []
+        self.v2_routers = []
+        self.parent_refs_present = False
+        self.service_middlewares_present = False
+        self.v38_fields = []
+        self.unknown_middleware_types = []
+        self.plugin_middlewares = []
+
+    def all_routers(self):
+        out = list(self.http_routers.values())
+        out += list(self.tcp_routers.values())
+        out += list(self.udp_routers.values())
+        return out
+
+    def router_by_kind(self, kind):
+        if kind == "http":
+            return self.http_routers
+        if kind == "tcp":
+            return self.tcp_routers
+        return self.udp_routers
+
+
+# ---------------------------------------------------------------- loader
+
+def _load_one_file(path, fname_for_display):
+    """Parse one dynamic/static file by extension -> (data, prov,
+    templated)."""
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    templated = _strip_go_templates_check(text, fname_for_display)
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".yml", ".yaml"):
+        data, prov = parse_yaml(text, fname_for_display)
+    elif ext == ".toml":
+        data, prov = parse_toml(text, fname_for_display)
+    else:
+        fatal("unsupported config extension %r" % ext, fname_for_display)
+    if not isinstance(data, dict):
+        fatal("top level of %s is not a mapping" % fname_for_display,
+              fname_for_display)
+    return data, prov, templated
+
+
+def _prov_line(prov, path, default):
+    return prov.get(tuple(path), default)
+
+
+def _as_list(value, where, what):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    fatal("%s must be a list" % what, where)
+
+
+def _as_dict(value, where, what):
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    fatal("%s must be a mapping" % what, where)
+
+
+def _as_str(value, where, what):
+    if isinstance(value, str):
+        return value
+    fatal("%s must be a string" % what, where)
+
+
+def _as_int(value, where, what):
+    if isinstance(value, bool):
+        fatal("%s must be an integer" % what, where)
+    if isinstance(value, int):
+        return value
+    fatal("%s must be an integer" % what, where)
+
+
+def load_config(conf_path, static_path, findings):
+    """Load the dynamic tree (+ optional static file) into a
+    LoadedConfig. Raises ConfigFatal / UsageError."""
+    cfg = LoadedConfig()
+    cfg.findings = findings
+
+    # -- resolve --conf: directory or single file (TR01 filename form)
+    if not os.path.exists(conf_path):
+        raise UsageError("--conf %s does not exist" % conf_path)
+    dynamic_files = []
+    static_from_conf = None
+    if os.path.isdir(conf_path):
+        for name in sorted(os.listdir(conf_path)):
+            full = os.path.join(conf_path, name)
+            if os.path.isdir(full):
+                cfg.ignored_files.append((full, "subdirectory not descended"))
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if name in ("traefik.yml", "traefik.yaml", "traefik.toml"):
+                static_from_conf = full
+                continue
+            if ext in (".yml", ".yaml", ".toml"):
+                dynamic_files.append(full)
+            elif ext == ".json":
+                cfg.ignored_files.append(
+                    (full, ".json is not a file-provider format (ignored)"))
+            else:
+                cfg.ignored_files.append((full, "unrecognized extension"))
+    else:
+        dynamic_files = [conf_path]
+
+    # -- static file: explicit --static wins; else top-level
+    #    traefik.yml in --conf (TR01 discovery, no /etc guessing).
+    static_file = static_path or static_from_conf
+    static_data = None
+    static_prov = {}
+    if static_file:
+        static_data, static_prov, _t = _load_one_file(
+            static_file, static_file)
+        cfg.static.file = static_file
+        _extract_static(cfg, static_data, static_prov)
+        # If --conf names the same file, its http:/tcp:/... sections
+        # are dynamic config too (Files and lines).
+        if static_from_conf and static_path and \
+                os.path.abspath(static_path) == os.path.abspath(static_from_conf):
+            dynamic_files.append(static_from_conf)
+        elif static_from_conf and not static_path:
+            dynamic_files.append(static_from_conf)
+
+    # -- dynamic files, alphabetical order (TR25 last-wins)
+    for path in dynamic_files:
+        data, prov, templated = _load_one_file(path, path)
+        cfg.files.append((path, "dynamic"))
+        if templated:
+            cfg.templated_files.append(path)
+        _merge_dynamic(cfg, data, prov, path, templated)
+
+    _validate_cross_refs(cfg)
+    _validate_tls_conflicts(cfg)
+    _build_internal_routers(cfg)
+    _shadow_analysis(cfg)
+    return cfg
+
+
+def _extract_static(cfg, data, prov):
+    st = cfg.static
+    eps = _as_dict(data.get("entryPoints"), "static", "entryPoints")
+    for name, ep in eps.items():
+        if "@" in name:
+            fatal("entrypoint name %r contains '@'" % name, "static")
+        st.entrypoints[name] = _as_dict(ep, "static",
+                                         "entryPoints.%s" % name)
+    core = _as_dict(data.get("core"), "static", "core")
+    if "defaultRuleSyntax" in core:
+        val = _as_str(core["defaultRuleSyntax"], "static",
+                      "core.defaultRuleSyntax")
+        if val not in ("v2", "v3"):
+            fatal("core.defaultRuleSyntax must be v2 or v3, got %r" % val,
+                  "static")
+        st.default_rule_syntax = val
+        if val == "v2":
+            cfg.findings.append(
+                "[v2-rule-syntax-deprecated] static file sets "
+                "defaultRuleSyntax: v2 (deprecated, removal in next major)")
+    providers = _as_dict(data.get("providers"), "static", "providers")
+    for pname, pconf in providers.items():
+        st.providers[pname] = pconf
+        if pname in NON_FILE_PROVIDERS:
+            cfg.findings.append(
+                "[%s-provider-enabled-not-read] static file enables the "
+                "%s provider; its routers are invisible to this tool "
+                "(file-provider-only verdict)" % (pname, pname))
+    if "precedence" in providers:
+        prec = providers.get("precedence")
+        if isinstance(prec, list):
+            st.precedence = [str(p) for p in prec]
+    api = data.get("api")
+    if isinstance(api, dict):
+        if api.get("insecure") or api.get("dashboard"):
+            st.api_enabled = True
+        eps = api.get("entryPoints")
+        if isinstance(eps, list):
+            st.api_entrypoints = [str(e) for e in eps]
+    elif api is True:
+        st.api_enabled = True
+    resolvers = _as_dict(data.get("certificatesResolvers"), "static",
+                         "certificatesResolvers")
+    st.cert_resolvers = set(resolvers.keys())
+    tls = data.get("tls")
+    if isinstance(tls, dict) and tls.get("certificates"):
+        st.has_tls_certs = True
+
+
+def _merge_dynamic(cfg, data, prov, path, templated):
+    """Merge one dynamic file's http:/tcp:/udp:/tls: sections."""
+    for kind in ("http", "tcp", "udp"):
+        section = data.get(kind)
+        if section is None:
+            continue
+        section = _as_dict(section, path, "%s section" % kind)
+        for name, rdata in _as_dict(
+                section.get("routers"), path, "%s.routers" % kind).items():
+            _add_router(cfg, kind, name, rdata, prov, path, templated)
+        for name, sdata in _as_dict(
+                section.get("services"), path, "%s.services" % kind).items():
+            _add_service(cfg, kind, name, sdata, prov, path, templated)
+        for name, mdata in _as_dict(
+                section.get("middlewares"), path,
+                "%s.middlewares" % kind).items():
+            _add_middleware(cfg, name, mdata, prov, path, templated,
+                            kind)
+    tls = data.get("tls")
+    if isinstance(tls, dict):
+        for name, odata in _as_dict(
+                tls.get("options"), path, "tls.options").items():
+            line = _prov_line(prov, ("tls", "options", name), 1)
+            if name in cfg.tls_options:
+                old = cfg.tls_options[name]
+                cfg.duplicate_findings.append(
+                    "[duplicate-tls-option-shadowed] tls.options %r in %s "
+                    "shadows %s" % (name, path, old.where))
+            opt = TlsOption(name, path, line)
+            opt.data = _as_dict(odata, path, "tls.options.%s" % name)
+            cfg.tls_options[name] = opt
+        for cert in _as_list(tls.get("certificates"), path,
+                             "tls.certificates"):
+            cert = _as_dict(cert, path, "tls.certificates entry")
+            cf = cert.get("certFile")
+            kf = cert.get("keyFile")
+            line = _prov_line(prov, ("tls", "certificates"), 1)
+            cfg.tls_certs.append((cf, kf, "%s:%d" % (path, line)))
+            # TR27: a missing local absolute cert file is a fatal.
+            for p in (cf, kf):
+                if isinstance(p, str) and os.path.isabs(p) \
+                        and not os.path.exists(p):
+                    fatal("tls.certificates file %s does not exist" % p,
+                          "%s:%d" % (path, line))
+
+
+def _add_router(cfg, kind, name, rdata, prov, path, templated):
+    if "@" in name:
+        fatal("router name %r contains '@' (not authorized)" % name, path)
+    table = cfg.router_by_kind(kind)
+    base = (kind, "routers", name)
+    line = _prov_line(prov, base, 1)
+    where = "%s:%d" % (path, line)
+    rdata = _as_dict(rdata, where, "router %s" % name)
+    if name in table:
+        old = table[name]
+        cfg.duplicate_findings.append(
+            "[duplicate-router-shadowed] router %r in %s shadows %s "
+            "(last file in alphabetical order wins)" % (name, path, old.where))
+    r = Router(name, kind, path, line)
+    r.templated = templated
+    if rdata.get("parentRefs") is not None:
+        r.parent_refs = _as_list(rdata.get("parentRefs"), where,
+                                 "parentRefs")
+        cfg.parent_refs_present = True
+        cfg.findings.append(
+            "[parentRefs-requires-3.6+] router %s uses multi-layer "
+            "routing (parentRefs)" % name)
+    if kind == "udp":
+        eps = rdata.get("entryPoints")
+        if eps is not None:
+            r.entrypoints = [_as_str(e, where, "entryPoints") for e in
+                             _as_list(eps, where, "entryPoints")]
+        svc = rdata.get("service")
+        if svc is not None:
+            r.service_ref = _as_str(svc, where, "service")
+            r.service_line = _prov_line(prov, base + ("service",), line)
+        table[name] = r
+        return
+    rule = rdata.get("rule")
+    if rule is None:
+        fatal("router %s has no rule (rule is required in the file "
+              "provider)" % name, where)
+    r.rule = _as_str(rule, where, "rule")
+    # A rule written as a YAML block/folded scalar carries a trailing
+    # newline from scalar processing; that newline is an artifact of
+    # the scalar style, not part of the rule an author wrote. Strip
+    # it (interior folding, newlines -> spaces, is kept per TR36).
+    r.rule = r.rule.strip()
+    r.rule_line = _prov_line(prov, base + ("rule",), line)
+    eps = rdata.get("entryPoints")
+    if eps is not None:
+        r.entrypoints = [_as_str(e, where, "entryPoints") for e in
+                         _as_list(eps, where, "entryPoints")]
+    svc = rdata.get("service")
+    if svc is None:
+        fatal("router %s has no service (service is required in the "
+              "file provider: it does not auto-create services)" % name,
+              where)
+    r.service_ref = _as_str(svc, where, "service")
+    r.service_line = _prov_line(prov, base + ("service",), line)
+    mws = rdata.get("middlewares")
+    if mws is not None:
+        r.middleware_refs = [_as_str(m, where, "middlewares") for m in
+                             _as_list(mws, where, "middlewares")]
+    prio = rdata.get("priority")
+    if prio is not None:
+        prio = _as_int(prio, where, "priority")
+        if prio > MAX_USER_PRIORITY:
+            fatal("priority %d exceeds the user maximum %d (reserved "
+                  "band)" % (prio, MAX_USER_PRIORITY), where)
+        r.explicit_priority = prio
+    if rdata.get("ruleSyntax") is not None:
+        syn = _as_str(rdata.get("ruleSyntax"), where, "ruleSyntax")
+        if syn not in ("v2", "v3"):
+            fatal("ruleSyntax must be v2 or v3, got %r" % syn, where)
+        r.syntax = syn
+    elif cfg.static.default_rule_syntax:
+        r.syntax = cfg.static.default_rule_syntax
+    if r.syntax == "v2":
+        cfg.v2_routers.append(r)
+        cfg.findings.append(
+            "[v2-rule-syntax-deprecated] router %s uses v2 rule syntax "
+            "(deprecated, removal in next major)" % name)
+    tls = rdata.get("tls")
+    if tls is not None and tls is not False:
+        r.tls = _as_dict(tls, where, "tls") if tls is not True else {}
+        r.tls_line = _prov_line(prov, base + ("tls",), line)
+    rt = rdata.get("respondingTimeouts")
+    if rt is not None:
+        r.responding_timeouts = _as_dict(rt, where, "respondingTimeouts")
+        cfg.v38_fields.append(
+            "[v3.8-only] router %s sets per-router respondingTimeouts "
+            "(v3.8 feature; pinned version is v3.7)" % name)
+        rd = r.responding_timeouts.get("readTimeout")
+        wr = r.responding_timeouts.get("writeTimeout")
+        if rd is not None and wr is not None:
+            if _timeout_seconds(rd) > _timeout_seconds(wr):
+                fatal("respondingTimeouts.readTimeout exceeds "
+                      "writeTimeout; Traefik disables such a router",
+                      where)
+    if rdata.get("observability") is not None:
+        r.observability = _as_dict(rdata.get("observability"), where,
+                                   "observability")
+    if templated:
+        # A Go-template file's rules cannot be trusted as written:
+        # skip parsing/validation; the router is UNKNOWN at verdict
+        # time, never a fatal, never in the walk.
+        cfg.findings.append(
+            "[go-template-not-evaluated] %s contains Go templates; "
+            "router %s is unevaluated" % (path, name))
+        table[name] = r
+        return
+    # Parse + validate the rule now: a broken rule is a config-fatal.
+    rwhere = "%s:%d" % (path, r.rule_line or line)
+    r.ast = parse_rule(r.rule, rwhere)
+    r.compiled = validate_rule(r.ast, r.syntax, kind, rwhere,
+                               cfg.findings)
+    if r.explicit_priority not in (None, 0):
+        r.priority = r.explicit_priority
+    else:
+        r.priority = rule_priority(r.rule, r.ast, r.syntax)
+    table[name] = r
+
+
+def _timeout_seconds(value):
+    """Parse a Go duration-ish value to seconds (best effort)."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(ns|us|µs|ms|s|m|h)?",
+                     str(value).strip())
+    if not m:
+        return 0.0
+    mult = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1.0,
+            "m": 60.0, "h": 3600.0, None: 1.0}
+    return float(m.group(1)) * mult[m.group(2)]
+
+
+def _add_service(cfg, kind, name, sdata, prov, path, templated):
+    if "@" in name:
+        fatal("service name %r contains '@' (not authorized)" % name, path)
+    base = (kind, "services", name)
+    line = _prov_line(prov, base, 1)
+    where = "%s:%d" % (path, line)
+    sdata = _as_dict(sdata, where, "service %s" % name)
+    key = (kind, name)
+    if key in cfg.services:
+        old = cfg.services[key]
+        cfg.duplicate_findings.append(
+            "[duplicate-service-shadowed] service %r in %s shadows %s"
+            % (name, path, old.where))
+    s = Service(name, kind, path, line)
+    s.templated = templated
+    known_types = ("loadBalancer", "weighted", "mirroring", "failover")
+    found = [t for t in known_types if t in sdata]
+    if len(found) > 1:
+        fatal("service %s declares multiple types: %s"
+              % (name, ", ".join(found)), where)
+    if not found:
+        extra = [k for k in sdata if k != "middlewares"]
+        fatal("service %s has unknown type key(s): %s (expected one of "
+              "%s)" % (name, ", ".join(extra) or "(none)",
+                       ", ".join(known_types)), where)
+    s.type = found[0]
+    s.data = _as_dict(sdata[found[0]], where, "service %s" % name)
+    mws = sdata.get("middlewares")
+    if mws is not None:
+        s.middlewares = [_as_str(m, where, "middlewares") for m in
+                         _as_list(mws, where, "middlewares")]
+        cfg.service_middlewares_present = True
+        cfg.findings.append(
+            "[service-middlewares-require-3.7+] service %s uses "
+            "middlewares on a service (v3.7 feature)" % name)
+    cfg.services[key] = s
+
+
+def _add_middleware(cfg, name, mdata, prov, path, templated, kind):
+    if "@" in name:
+        fatal("middleware name %r contains '@' (not authorized)" % name,
+              path)
+    base = ("http", "middlewares", name)
+    if kind == "tcp":
+        base = ("tcp", "middlewares", name)
+    line = _prov_line(prov, base, 1)
+    where = "%s:%d" % (path, line)
+    mdata = _as_dict(mdata, where, "middleware %s" % name)
+    if name in cfg.middlewares:
+        old = cfg.middlewares[name]
+        cfg.duplicate_findings.append(
+            "[duplicate-middleware-shadowed] middleware %r in %s "
+            "shadows %s" % (name, path, old.where))
+    if len(mdata) != 1:
+        fatal("middleware %s must declare exactly one type, got %d keys"
+              % (name, len(mdata)), where)
+    raw_type = next(iter(mdata))
+    mtype = normalize_middleware_type(raw_type)
+    m = Middleware(name, path, line)
+    m.templated = templated
+    m.type = mtype
+    m.config = _as_dict(mdata[raw_type], where,
+                        "middleware %s" % name) if mdata[raw_type] is not None \
+        else {}
+    if mtype in V38_ONLY_MIDDLEWARES:
+        cfg.v38_fields.append(
+            "[v3.8-only] middleware %s is type %s (v3.8 feature; pinned "
+            "version is v3.7)" % (name, mtype))
+        cfg.plugin_middlewares.append(m)
+    elif mtype in HTTP_BUILTIN_MIDDLEWARES or \
+            mtype in TCP_BUILTIN_MIDDLEWARES:
+        pass
+    else:
+        cfg.unknown_middleware_types.append(m)
+        cfg.findings.append(
+            "[unknown-middleware-type] middleware %s has type %r, not "
+            "in the v3.7 built-in inventory; treated as an opaque "
+            "plugin middleware" % (name, mtype))
+    cfg.middlewares[name] = m
+
+
+# ---------------------------------------------------------------- cross-refs
+
+def _validate_cross_refs(cfg):
+    """TR15/TR21/TR23/TR26: every reference must resolve."""
+    st = cfg.static
+    for r in cfg.all_routers():
+        if r.is_internal:
+            continue
+        if r.entrypoints:
+            for ep in r.entrypoints:
+                if st.file and ep not in st.entrypoints and ep != "traefik":
+                    fatal("router %s names unknown entrypoint %r (not "
+                          "defined in %s)" % (r.name, ep, st.file), r.where)
+        if r.kind == "udp":
+            if r.service_ref is not None:
+                _check_service_ref(cfg, r.service_ref, r.service_line, r)
+            continue
+        if r.service_ref is not None:
+            _check_service_ref(cfg, r.service_ref, r.service_line, r)
+        for ref in r.middleware_refs:
+            _check_middleware_ref(cfg, ref, r)
+    for (kind, name), s in cfg.services.items():
+        _validate_service_members(cfg, s)
+        for ref in s.middlewares:
+            _check_middleware_ref(cfg, ref, s)
+    # chain cycles (TR21) and service cycles (TR30)
+    for m in cfg.middlewares.values():
+        _check_chain_cycle(cfg, m, [m.name])
+    for s in cfg.services.values():
+        _check_service_cycle(cfg, s, [(s.kind, s.name)])
+
+
+def _check_service_ref(cfg, ref, line, router):
+    name, provider = split_provider_ref(
+        ref, "%s:%d" % (router.file, line or router.line), "service")
+    if provider == "internal":
+        if name not in ("api", "dashboard", "ping", "noop", "acme-http"):
+            fatal("unknown internal service %r" % ref, router.where)
+        return
+    if provider != "file":
+        return  # cross-provider: UNKNOWN at verdict time, not a fatal
+    if (router.kind, name) not in cfg.services:
+        fatal("router %s references undefined service %r"
+              % (router.name, ref), router.where)
+
+
+def _check_middleware_ref(cfg, ref, owner):
+    name, provider = split_provider_ref(ref, owner.where, "middleware")
+    if provider != "file":
+        if provider == "internal":
+            fatal("middleware reference %r names the internal provider, "
+                  "which defines no middlewares" % ref, owner.where)
+        return  # cross-provider: UNKNOWN at verdict time
+    if name not in cfg.middlewares:
+        fatal("%s references undefined middleware %r"
+              % (getattr(owner, "name", "?"), ref), owner.where)
+
+
+def _validate_service_members(cfg, svc):
+    """Members of weighted/mirroring/failover must exist (TR23/TR30)."""
+    if svc.type == "weighted":
+        for member in _as_list(svc.data.get("services"), svc.where,
+                               "weighted.services"):
+            member = _as_dict(member, svc.where, "weighted member")
+            ref = member.get("name")
+            if ref is None:
+                fatal("weighted service %s has a member with no name"
+                      % svc.name, svc.where)
+            _check_service_ref(cfg, _as_str(ref, svc.where, "name"),
+                               svc.line, _FakeRouter(svc))
+    elif svc.type == "mirroring":
+        main = svc.data.get("service")
+        if main is not None:
+            _check_service_ref(cfg, _as_str(main, svc.where, "service"),
+                               svc.line, _FakeRouter(svc))
+        for mirror in _as_list(svc.data.get("mirrors"), svc.where,
+                               "mirroring.mirrors"):
+            mirror = _as_dict(mirror, svc.where, "mirror")
+            ref = mirror.get("name")
+            if ref is not None:
+                _check_service_ref(cfg, _as_str(ref, svc.where, "name"),
+                                   svc.line, _FakeRouter(svc))
+    elif svc.type == "failover":
+        for field in ("service", "fallback"):
+            ref = svc.data.get(field)
+            if ref is not None:
+                _check_service_ref(cfg, _as_str(ref, svc.where, field),
+                                   svc.line, _FakeRouter(svc))
+
+
+class _FakeRouter:
+    """Adapter so _check_service_ref can take a Service as owner."""
+    def __init__(self, svc):
+        self.name = svc.name
+        self.kind = svc.kind
+        self.file = svc.file
+        self.line = svc.line
+        self.where = svc.where
+
+
+def _check_chain_cycle(cfg, mw, stack):
+    if mw.type != "Chain":
+        return
+    for ref in _as_list(mw.config.get("middlewares"), mw.where,
+                        "chain middlewares"):
+        name, provider = split_provider_ref(ref, mw.where, "middleware")
+        if provider != "file":
+            continue
+        if name in stack:
+            fatal("middleware chain cycle: %s"
+                  % " -> ".join(stack + [name]), mw.where)
+        nxt = cfg.middlewares.get(name)
+        if nxt is not None:
+            _check_chain_cycle(cfg, nxt, stack + [name])
+
+
+def _check_service_cycle(cfg, svc, stack):
+    def members_of(s):
+        refs = []
+        if s.type == "weighted":
+            for m in _as_list(s.data.get("services"), s.where,
+                              "weighted.services"):
+                m = _as_dict(m, s.where, "weighted member")
+                if m.get("name"):
+                    refs.append(_as_str(m["name"], s.where, "name"))
+        elif s.type == "mirroring":
+            if s.data.get("service"):
+                refs.append(_as_str(s.data["service"], s.where, "service"))
+            for mir in _as_list(s.data.get("mirrors"), s.where,
+                                "mirroring.mirrors"):
+                mir = _as_dict(mir, s.where, "mirror")
+                if mir.get("name"):
+                    refs.append(_as_str(mir["name"], s.where, "name"))
+        elif s.type == "failover":
+            for f in ("service", "fallback"):
+                if s.data.get(f):
+                    refs.append(_as_str(s.data[f], s.where, f))
+        return refs
+    for ref in members_of(svc):
+        name, provider = split_provider_ref(ref, svc.where, "service")
+        if provider != "file":
+            continue
+        key = (svc.kind, name)
+        if key in stack:
+            fatal("service cycle: %s"
+                  % " -> ".join("%s/%s" % k for k in stack + [key]),
+                  svc.where)
+        nxt = cfg.services.get(key)
+        if nxt is not None:
+            _check_service_cycle(cfg, nxt, stack + [key])
+
+
+def _validate_tls_conflicts(cfg):
+    """TR18: two routers serving the same hostname on the same
+    entrypoint with different tls.options is a config-fatal."""
+    def host_literals(router):
+        hosts = set()
+        def walk(node):
+            if node[0] in ("and", "or"):
+                walk(node[1])
+                walk(node[2])
+            elif node[0] == "not":
+                walk(node[1])
+            elif node[0] == "match" and node[1] == "Host":
+                for a in node[2]:
+                    hosts.add(a.lower())
+        if router.ast is not None:
+            walk(router.ast)
+        return hosts
+    def eps(router):
+        if router.entrypoints:
+            return set(router.entrypoints)
+        return None  # all entrypoints
+    def tls_opts(router):
+        if router.tls and isinstance(router.tls.get("options"), str):
+            return router.tls["options"]
+        return None
+    routers = [r for r in cfg.all_routers()
+               if r.kind == "http" and not r.is_internal]
+    for i, a in enumerate(routers):
+        oa = tls_opts(a)
+        if oa is None:
+            continue
+        for b in routers[i + 1:]:
+            ob = tls_opts(b)
+            if ob is None or ob == oa:
+                continue
+            if not (host_literals(a) & host_literals(b)):
+                continue
+            ea, eb = eps(a), eps(b)
+            if ea is not None and eb is not None and not (ea & eb):
+                continue
+            fatal("conflicting tls.options for hostname(s) %s: router %s "
+                  "uses %r, router %s uses %r"
+                  % (", ".join(sorted(host_literals(a) &
+                                      host_literals(b))),
+                     a.name, oa, b.name, ob), b.where)
+    # tls.options references must exist (TR18)
+    for r in routers:
+        if r.tls:
+            opt = r.tls.get("options")
+            if isinstance(opt, str) and opt not in cfg.tls_options:
+                fatal("router %s references undefined tls.options %r"
+                      % (r.name, opt), r.where)
+
+
+def _build_internal_routers(cfg):
+    """TR34/TR35: model Traefik's internal routers when the static
+    file enables them, with reserved-band priorities (ACME > API >
+    dashboard > ping, [hypothesized])."""
+    st = cfg.static
+    if not st.file:
+        return
+    band = MAX_USER_PRIORITY + 1000  # MaxInt64
+    if st.api_enabled:
+        eps = st.api_entrypoints or ["traefik"]
+        api = Router("api", "http", st.file, 1)
+        api.is_internal = True
+        api.rule = "PathPrefix(`/api`)"
+        api.ast = parse_rule(api.rule, st.file)
+        api.compiled = validate_rule(api.ast, "v3", "http", st.file, [])
+        api.priority = band - 2
+        api.entrypoints = list(eps)
+        api.service_ref = "api@internal"
+        cfg.http_routers["api@internal"] = api
+        dash = Router("dashboard", "http", st.file, 1)
+        dash.is_internal = True
+        dash.rule = "PathPrefix(`/dashboard`)"
+        dash.ast = parse_rule(dash.rule, st.file)
+        dash.compiled = validate_rule(dash.ast, "v3", "http", st.file, [])
+        dash.priority = band - 3
+        dash.entrypoints = list(eps)
+        dash.service_ref = "dashboard@internal"
+        cfg.http_routers["dashboard@internal"] = dash
+        ping = Router("ping", "http", st.file, 1)
+        ping.is_internal = True
+        ping.rule = "Path(`/ping`)"
+        ping.ast = parse_rule(ping.rule, st.file)
+        ping.compiled = validate_rule(ping.ast, "v3", "http", st.file, [])
+        ping.priority = band - 4
+        ping.entrypoints = list(eps)
+        ping.service_ref = "ping@internal"
+        cfg.http_routers["ping@internal"] = ping
+    # ACME HTTP-01 challenge handler claims /.well-known/acme-challenge/
+    # on `web` before user routers, when any certResolver is in play.
+    if st.cert_resolvers or any(
+            (r.tls and r.tls.get("certResolver"))
+            for r in cfg.all_routers() if r.kind == "http"):
+        acme = Router("acme-http", "http", st.file, 1)
+        acme.is_internal = True
+        acme.rule = "PathPrefix(`/.well-known/acme-challenge/`)"
+        acme.ast = parse_rule(acme.rule, st.file)
+        acme.compiled = validate_rule(acme.ast, "v3", "http", st.file, [])
+        acme.priority = band - 1
+        acme.entrypoints = ["web"]
+        acme.service_ref = "acme-http@internal"
+        cfg.http_routers["acme-http@internal"] = acme
+
+
+def _shadow_analysis(cfg):
+    """TR38: conservative literal-containment shadowing. A router is
+    shadowed when a higher-priority router's rule is a superset
+    provable from literals: single Host(x) under Host(x) &&
+    PathPrefix(`/`), or anything under a higher-priority bare
+    Host(`*`) catch-all."""
+    def conjuncts(router):
+        out = []
+        def walk(node):
+            if node[0] == "and":
+                walk(node[1])
+                walk(node[2])
+            else:
+                out.append(node)
+        if router.ast is not None:
+            walk(router.ast)
+        return out
+    def is_universal(node):
+        if node[0] == "match" and node[1] == "PathPrefix" \
+                and node[2] == ["/"]:
+            return True
+        if node[0] == "match" and node[1] == "Host" and node[2] == ["*"]:
+            return True
+        return False
+    routers = [r for r in cfg.all_routers()
+               if r.kind in ("http", "tcp") and not r.is_internal
+               and not r.templated and r.priority is not None
+               and r.ast is not None]
+    for a in routers:
+        ca = conjuncts(a)
+        for b in routers:
+            if a is b or b.priority <= a.priority:
+                continue
+            cb = conjuncts(b)
+            # catch-all shadows everything on overlapping entrypoints
+            if len(cb) == 1 and cb[0][0] == "match" \
+                    and cb[0][1] in ("Host", "HostSNI") \
+                    and cb[0][2] == ["*"]:
+                if _eps_overlap(a, b):
+                    cfg.shadow_findings.append(
+                        "[shadowed-by] router %s (%s) is shadowed by "
+                        "catch-all router %s (%s, priority %d)"
+                        % (a.name, a.where, b.name, b.where, b.priority))
+                    break
+                continue
+            # A = single Host(x); B = Host(x) && (universal terms only)
+            if len(ca) == 1 and ca[0][0] == "match" \
+                    and ca[0][1] in ("Host", "HostSNI"):
+                if any(c[0] == "match" and c[1] == ca[0][1]
+                       and c[2] == ca[0][2] for c in cb) and \
+                        all(is_universal(c) or
+                            (c[0] == "match" and c[1] == ca[0][1]
+                             and c[2] == ca[0][2]) for c in cb) and \
+                        len(cb) > 1 and _eps_overlap(a, b):
+                    cfg.shadow_findings.append(
+                        "[shadowed-by] router %s (%s) is shadowed by "
+                        "router %s (%s, priority %d): its rule is a "
+                        "subset of %s's rule"
+                        % (a.name, a.where, b.name, b.where, b.priority,
+                           b.name))
+                    break
+
+
+def _eps_overlap(a, b):
+    if a.entrypoints is None or b.entrypoints is None:
+        return True
+    return bool(set(a.entrypoints) & set(b.entrypoints))
+
+# ---------------------------------------------------------------- services
+# Service resolution (TR23/TR29/TR30/TR32) and middleware chains
+# (TR21/TR22/TR23).
+
+OUTCOME_MIDDLEWARES = {
+    "RedirectScheme", "RedirectRegex", "BasicAuth", "DigestAuth",
+    "ForwardAuth", "IPAllowList", "RateLimit", "InFlightReq",
+    "CircuitBreaker", "Errors", "Retry", "InFlightConn",
+}
+REWRITE_MIDDLEWARES = {
+    "StripPrefix", "StripPrefixRegex", "ReplacePath", "ReplacePathRegex",
+    "AddPrefix", "StripPort", "Headers", "PassTLSClientCert", "GrpcWeb",
+}
+
+
+def classify_middleware(mw):
+    if mw.type in OUTCOME_MIDDLEWARES:
+        return "outcome-changing"
+    if mw.type in REWRITE_MIDDLEWARES:
+        return "request-rewriting"
+    return "response-only / opaque"
+
+
+def expand_chain(cfg, refs, owner_where, depth=0):
+    """Expand middleware refs (chains in place, recursively).
+    Returns (list[Middleware], cross_provider_ref_or_None).
+    Raises ConfigFatal on a chain cycle (also load-validated)."""
+    if depth > 16:
+        fatal("middleware chain nesting too deep", owner_where)
+    out = []
+    for ref in refs:
+        name, provider = split_provider_ref(ref, owner_where, "middleware")
+        if provider != "file":
+            return None, ref
+        mw = cfg.middlewares.get(name)
+        if mw is None:
+            fatal("undefined middleware %r" % ref, owner_where)
+        if mw.type == "Chain":
+            sub, cross = expand_chain(
+                cfg, _as_list(mw.config.get("middlewares"), mw.where,
+                              "chain middlewares"), mw.where, depth + 1)
+            if cross is not None:
+                return None, cross
+            out.extend(sub)
+        else:
+            out.append(mw)
+    return out, None
+
+
+def _go_replacement_to_python(repl):
+    """Convert a Go regexp replacement ($1, ${1}, $$) to Python's."""
+    out = []
+    i = 0
+    while i < len(repl):
+        c = repl[i]
+        if c == "$" and i + 1 < len(repl):
+            nxt = repl[i + 1]
+            if nxt == "$":
+                out.append("$")
+                i += 2
+            elif nxt == "{":
+                j = repl.find("}", i + 2)
+                if j >= 0 and repl[i + 2:j].isdigit():
+                    out.append("\\" + repl[i + 2:j])
+                    i = j + 1
+                else:
+                    out.append("$")
+                    i += 1
+            elif nxt.isdigit():
+                out.append("\\" + nxt)
+                i += 2
+            else:
+                out.append("$")
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def apply_rewrites(chain, path):
+    """Apply path-modifying middlewares in chain order (TR22).
+    Returns (final_path, steps) where steps are (middleware, old, new).
+    StripPrefix strips the first matching prefix in declared order
+    [docs-inferred]; StripPrefixRegex strips a match anchored at 0."""
+    cur = path
+    steps = []
+    for mw in chain:
+        new = None
+        if mw.type == "StripPrefix":
+            for prefix in mw.config.get("prefixes", []) or []:
+                if cur.startswith(str(prefix)):
+                    new = cur[len(str(prefix)):]
+                    if new == "" and mw.config.get("forceSlash"):
+                        new = "/"
+                    break
+        elif mw.type == "StripPrefixRegex":
+            for pattern in mw.config.get("regexes", []) or []:
+                try:
+                    m = re.search(str(pattern), cur)
+                except re.error:
+                    continue
+                if m and m.start() == 0:
+                    new = cur[m.end():]
+                    if new == "" and mw.config.get("forceSlash"):
+                        new = "/"
+                    break
+        elif mw.type == "ReplacePath":
+            new = str(mw.config.get("path", cur))
+        elif mw.type == "ReplacePathRegex":
+            pattern = mw.config.get("regex")
+            replacement = mw.config.get("replacement", "")
+            if pattern:
+                try:
+                    new = re.sub(str(pattern),
+                                 _go_replacement_to_python(str(replacement)),
+                                 cur)
+                except re.error:
+                    new = None
+        elif mw.type == "AddPrefix":
+            new = str(mw.config.get("prefix", "")) + cur
+        if new is not None and new != cur:
+            steps.append((mw, cur, new))
+            cur = new
+    return cur, steps
+
+
+def service_servers(cfg, svc, depth=0):
+    """Resolve a service -> report dict. Recursion cap 8, cycle
+    already load-validated (TR30)."""
+    if depth > 8:
+        fatal("service nesting too deep", svc.where)
+    rep = {"name": svc.name, "kind": svc.kind, "file": svc.file,
+           "line": svc.line, "type": svc.type, "banners": [],
+           "servers": [], "members": [], "has_servers": False,
+           "effective": None}
+    if svc.type == "loadBalancer":
+        servers = _as_list(svc.data.get("servers"), svc.where, "servers")
+        for srv in servers:
+            srv = _as_dict(srv, svc.where, "server")
+            url = srv.get("url") or srv.get("address")
+            if url is not None:
+                rep["servers"].append(str(url))
+        rep["has_servers"] = bool(rep["servers"])
+        if svc.data.get("healthCheck") is not None:
+            rep["banners"].append(
+                "[server-health-runtime] healthCheck configured; whether "
+                "any server is currently healthy is runtime")
+        elif rep["has_servers"]:
+            rep["banners"].append(
+                "[servers-present-no-healthcheck] servers listed, no "
+                "health check configured")
+        transport = svc.data.get("serversTransport")
+        if isinstance(transport, dict) and \
+                transport.get("insecureSkipVerify"):
+            rep["banners"].append(
+                "[backend-tls-insecure] serversTransport sets "
+                "insecureSkipVerify: backend TLS is not verified")
+        if svc.data.get("sticky") is not None:
+            rep["banners"].append(
+                "sticky sessions configured (same client may pin to one "
+                "server; router and service unchanged)")
+    elif svc.type == "weighted":
+        members = []
+        total_positive = 0
+        for m in _as_list(svc.data.get("services"), svc.where,
+                          "weighted.services"):
+            m = _as_dict(m, svc.where, "weighted member")
+            ref = _as_str(m.get("name"), svc.where, "name")
+            weight = m.get("weight", 1)
+            name, provider = split_provider_ref(ref, svc.where, "service")
+            sub = None
+            if provider == "file":
+                subsvc = cfg.services.get((svc.kind, name))
+                if subsvc is not None:
+                    sub = service_servers(cfg, subsvc, depth + 1)
+            members.append({"ref": ref, "weight": weight, "report": sub})
+            if isinstance(weight, (int, float)) and weight > 0:
+                total_positive += 1
+        rep["members"] = members
+        rep["has_servers"] = any(
+            m["report"] and m["report"]["has_servers"] for m in members)
+        positive = [m for m in members
+                    if isinstance(m["weight"], (int, float))
+                    and m["weight"] > 0]
+        if len(positive) == 1 and len(members) > 1:
+            rep["effective"] = positive[0]["ref"]
+            rep["banners"].append(
+                "[weighted-single-member] only %s has weight > 0, so it "
+                "is the effective service" % positive[0]["ref"])
+        else:
+            rep["banners"].append(
+                "[weighted-routing-runtime] member selection is by "
+                "weight at runtime; the verdict names the service")
+    elif svc.type == "mirroring":
+        main_ref = svc.data.get("service")
+        mirrors = []
+        for m in _as_list(svc.data.get("mirrors"), svc.where,
+                          "mirroring.mirrors"):
+            m = _as_dict(m, svc.where, "mirror")
+            mirrors.append({"ref": m.get("name"),
+                            "percent": m.get("percent")})
+        rep["members"] = [{"ref": main_ref, "role": "main"}] + [
+            {"ref": m["ref"], "role": "mirror", "percent": m["percent"]}
+            for m in mirrors]
+        rep["banners"].append(
+            "[mirroring-copy] mirrors receive a copy of the request; "
+            "the response still comes from the main service")
+        if main_ref:
+            name, provider = split_provider_ref(main_ref, svc.where,
+                                                "service")
+            if provider == "file":
+                sub = cfg.services.get((svc.kind, name))
+                if sub is not None:
+                    rep["has_servers"] = service_servers(
+                        cfg, sub, depth + 1)["has_servers"]
+    elif svc.type == "failover":
+        main_ref = svc.data.get("service")
+        fb_ref = svc.data.get("fallback")
+        rep["members"] = [{"ref": main_ref, "role": "main"},
+                          {"ref": fb_ref, "role": "fallback"}]
+        rep["banners"].append(
+            "[failover-on-health-runtime] the fallback is used only "
+            "when the main service is unhealthy (runtime)")
+        for ref in (main_ref, fb_ref):
+            if not ref:
+                continue
+            name, provider = split_provider_ref(ref, svc.where, "service")
+            if provider == "file":
+                sub = cfg.services.get((svc.kind, name))
+                if sub is not None and service_servers(
+                        cfg, sub, depth + 1)["has_servers"]:
+                    rep["has_servers"] = True
+    if not rep["has_servers"]:
+        rep["banners"].append(
+            "[service-has-no-servers] the live answer would be 503")
+    return rep
+
+
+def resolve_service_ref(cfg, ref, kind, where):
+    """-> (status, payload): status in file|internal|cross|missing."""
+    name, provider = split_provider_ref(ref, where, "service")
+    if provider == "internal":
+        return "internal", name
+    if provider != "file":
+        return "cross", provider
+    svc = cfg.services.get((kind, name))
+    if svc is None:
+        return "missing", name
+    return "file", svc
+
+
+# ---------------------------------------------------------------- walk
+
+def _entrypoint_term(router, entrypoint):
+    if router.entrypoints is None:
+        return TRUE, [], None
+    if entrypoint is None:
+        return UNKNOWN, [
+            "entrypoint UNKNOWN — router %s lists entrypoints %s "
+            "(supply --entrypoint)" % (router.name,
+                                       ", ".join(router.entrypoints))], \
+            "--entrypoint"
+    if entrypoint in router.entrypoints:
+        return TRUE, [], None
+    return FALSE, [
+        "[entrypoint-excluded] router %s is not attached to entrypoint "
+        "%s" % (router.name, entrypoint)], None
+
+
+def _tls_term_http(router, facts, cfg):
+    """TR18: router tls (or inherited entrypoint http.tls) makes the
+    router HTTPS-only. Returns (value, reasons, missing_flag)."""
+    if router.tls is not None:
+        https_only = True
+    else:
+        eps = router.entrypoints
+        if facts.entrypoint is not None:
+            ep = cfg.static.entrypoints.get(facts.entrypoint, {})
+            https_only = bool(
+                isinstance(ep.get("http"), dict)
+                and ep["http"].get("tls") is not None)
+        elif eps is not None:
+            states = []
+            for name in eps:
+                ep = cfg.static.entrypoints.get(name, {})
+                states.append(bool(
+                    isinstance(ep.get("http"), dict)
+                    and ep["http"].get("tls") is not None))
+            if states and all(states):
+                https_only = True
+            elif states and not any(states):
+                https_only = False
+            elif states:
+                return UNKNOWN, [
+                    "TLS scope UNKNOWN — entrypoints %s disagree on "
+                    "http.tls (supply --entrypoint)"
+                    % ", ".join(eps)], "--entrypoint"
+            else:
+                https_only = False
+        else:
+            # attached to all entrypoints: HTTPS-only only if every
+            # known entrypoint has TLS; unknown without --static.
+            if not cfg.static.file:
+                return TRUE, [], None
+            states = [bool(isinstance(ep.get("http"), dict)
+                           and ep["http"].get("tls") is not None)
+                      for ep in cfg.static.entrypoints.values()]
+            if states and all(states):
+                https_only = True
+            elif states and not any(states):
+                https_only = False
+            elif states:
+                return UNKNOWN, [
+                    "TLS scope UNKNOWN — entrypoints disagree on "
+                    "http.tls (supply --entrypoint)"], "--entrypoint"
+            else:
+                https_only = False
+    if not https_only:
+        return TRUE, [], None
+    if facts.tls is TRUE:
+        return TRUE, [], None
+    if facts.tls is FALSE:
+        return FALSE, [
+            "TLS scope FALSE — router %s is HTTPS-only but the request "
+            "is plain HTTP (--no-tls)" % router.name], None
+    return UNKNOWN, [
+        "TLS scope UNKNOWN — router %s is HTTPS-only (supply --tls or "
+        "--no-tls)" % router.name], "--tls"
+
+
+def _tls_term_tcp(router, facts):
+    """A TCP router with a tls block only handles TLS connections."""
+    if router.tls is None:
+        return TRUE, [], None
+    if facts.tls is TRUE:
+        return TRUE, [], None
+    if facts.tls is FALSE:
+        return FALSE, [
+            "TLS scope FALSE — TCP router %s terminates TLS but the "
+            "connection is plain (--no-tls)" % router.name], None
+    return UNKNOWN, [
+        "TLS scope UNKNOWN — TCP router %s terminates TLS (supply "
+        "--tls or --no-tls)" % router.name], "--tls"
+
+
+def evaluate_router(router, facts, cfg):
+    """Evaluate entrypoint + TLS + rule terms (Kleene AND).
+    Returns (value, deciding_reasons, missing_flags)."""
+    if router.templated or router.ast is None:
+        return UNKNOWN, [
+            "[go-template-not-evaluated] router %s comes from a file "
+            "containing Go templates; its rule is unknown"
+            % router.name], []
+    ep_val, ep_reasons, ep_flag = _entrypoint_term(router,
+                                                   facts.entrypoint)
+    if router.kind == "http":
+        tls_val, tls_reasons, tls_flag = _tls_term_http(router, facts, cfg)
+    else:
+        tls_val, tls_reasons, tls_flag = _tls_term_tcp(router, facts)
+    facts.router_has_tls = router.tls is not None
+    rule_val, rule_reasons = eval_rule(router.ast, facts, router.compiled,
+                                       router.kind, router.where)
+    val = TRUE
+    for v in (ep_val, tls_val, rule_val):
+        if v is FALSE:
+            val = FALSE
+            break
+        if v is UNKNOWN:
+            val = UNKNOWN
+    flags = [f for f in (ep_flag, tls_flag) if f]
+    if val is FALSE:
+        reasons = []
+        if ep_val is FALSE:
+            reasons += ep_reasons
+        if tls_val is FALSE:
+            reasons += tls_reasons
+        if rule_val is FALSE:
+            reasons += rule_reasons
+        return FALSE, reasons, flags
+    if val is UNKNOWN:
+        reasons = []
+        if ep_val is UNKNOWN:
+            reasons += ep_reasons
+        if tls_val is UNKNOWN:
+            reasons += tls_reasons
+        if rule_val is UNKNOWN:
+            reasons += rule_reasons
+        for fl in missing_flags_for(router.ast, facts, router.compiled,
+                                    router.kind, router.where):
+            if fl not in flags:
+                flags.append(fl)
+        return UNKNOWN, reasons, flags
+    return TRUE, rule_reasons, flags
+
+
+def _resolve_tr13(evaluated, cfg):
+    """TR13/TR14: sort TRUE by priority desc, name asc; an UNKNOWN
+    router that could outrank the best TRUE router blocks.
+    evaluated: list of dicts {router, value, reasons, flags}.
+    Returns (status, winner_or_None, blockers)."""
+    trues = [e for e in evaluated if e["value"] is TRUE]
+    unknowns = [e for e in evaluated if e["value"] is UNKNOWN]
+    if trues:
+        trues.sort(key=lambda e: (-e["router"].priority, e["router"].name))
+        best = trues[0]
+        blockers = [e for e in unknowns
+                    if e["router"].priority is not None
+                    and e["router"].priority >= best["router"].priority]
+        if blockers:
+            return "unknown", None, blockers
+        tie = [e for e in trues[1:]
+               if e["router"].priority == best["router"].priority]
+        if tie:
+            cfg.findings.append(
+                "[same-priority-tie-name-order] routers %s and %s share "
+                "priority %d; the tie is broken by router name ascending "
+                "[hypothesized]"
+                % (best["router"].name, tie[0]["router"].name,
+                   best["router"].priority))
+        return "match", best, []
+    if unknowns:
+        return "unknown", None, unknowns
+    return "no-match", None, []
+
+
+def _multi_layer_candidates(cfg, facts, kind):
+    """TR24: excluded child routers whose rule evaluates TRUE (or
+    UNKNOWN) against the raw request, with the parent chain present."""
+    out = []
+    for r in cfg.router_by_kind(kind).values():
+        if not r.parent_refs or r.templated or r.ast is None:
+            continue
+        parents_present = all(
+            p in cfg.router_by_kind(kind) for p in r.parent_refs)
+        if not parents_present:
+            continue
+        val, _reasons, _flags = evaluate_router(r, facts, cfg)
+        if val is not FALSE:
+            out.append(r)
+    return out
+
+
+def _tcp_gate(cfg, facts):
+    """TR16: for the http verb, does a TCP router on the entrypoint
+    evaluate TRUE or UNKNOWN on the available connection facts?
+    Returns the blocking router entry or None."""
+    for r in cfg.tcp_routers.values():
+        if r.parent_refs or r.templated:
+            continue
+        ep_val, _er, _f = _entrypoint_term(r, facts.entrypoint)
+        if ep_val is FALSE:
+            continue
+        if r.ast is None:
+            continue
+        facts.router_has_tls = r.tls is not None
+        rule_val, _rr = eval_rule(r.ast, facts, r.compiled, "tcp",
+                                  r.where)
+        tls_val, _tr, _tf = _tls_term_tcp(r, facts)
+        val = _kleene_and(_kleene_and(ep_val, tls_val), rule_val)
+        if val is not FALSE:
+            return {"router": r, "value": val}
+    return None
+
+
+def _redirect_check(cfg, facts):
+    """TR20: entrypoint redirection in --static. Returns a redirect
+    dict or None. The ACME challenge path is exempt."""
+    if not cfg.static.file or facts.entrypoint is None:
+        return None
+    ep = cfg.static.entrypoints.get(facts.entrypoint)
+    if not isinstance(ep, dict):
+        return None
+    http = ep.get("http")
+    if not isinstance(http, dict):
+        return None
+    redir = http.get("redirections")
+    if not isinstance(redir, dict):
+        return None
+    entry = redir.get("entryPoint")
+    if not isinstance(entry, dict):
+        return None
+    if isinstance(facts, HttpFacts) and \
+            facts.path.startswith("/.well-known/acme-challenge/"):
+        return None
+    target = entry.get("to")
+    scheme = entry.get("scheme", "https")
+    permanent = entry.get("permanent", True)
+    return {"entrypoint": facts.entrypoint, "target": target,
+            "scheme": scheme,
+            "status": 301 if permanent else 302}
+
+
+def _build_verdict_base(cfg, facts, kind):
+    """Shared coverage/findings block for every verdict."""
+    coverage = {
+        "provider": "file",
+        "files_read": [p for p, _k in cfg.files],
+        "files_ignored": [{"path": p, "reason": r}
+                          for p, r in cfg.ignored_files],
+        "routers": len(cfg.all_routers()),
+        "http_routers": len(cfg.http_routers),
+        "tcp_routers": len(cfg.tcp_routers),
+        "udp_routers": len(cfg.udp_routers),
+        "services": len(cfg.services),
+        "middlewares": len(cfg.middlewares),
+        "tls_options": len(cfg.tls_options),
+        "static_supplied": bool(cfg.static.file),
+        "static_file": cfg.static.file,
+        "pinned_traefik": PINNED_TRAEFIK,
+    }
+    return coverage
+
+
+def _winner_detail(cfg, router, facts, kind):
+    """Resolve the winner's service + middleware chains. Returns
+    (detail_dict, cross_ref_or_None, banners)."""
+    detail = {"router": router, "banners": []}
+    status, payload = resolve_service_ref(cfg, router.service_ref,
+                                          kind, router.where)
+    if status == "cross":
+        return None, ("service %s references provider %r (out of scope)"
+                      % (router.service_ref, payload)), []
+    if status == "missing":
+        return None, ("service %s is not defined" % router.service_ref), []
+    if status == "internal":
+        detail["service"] = {"name": payload, "kind": kind,
+                             "provider": "internal", "type": "internal",
+                             "banners": [], "servers": [], "members": [],
+                             "has_servers": True, "effective": None}
+    else:
+        svc = payload
+        detail["service"] = service_servers(cfg, svc)
+        detail["service"]["provider"] = "file"
+    # middleware chains: router first, then service (v3.7, TR23)
+    chain, cross = expand_chain(cfg, router.middleware_refs, router.where)
+    if cross is not None:
+        return None, ("middleware %s references a non-file provider "
+                      "(out of scope)" % cross), []
+    detail["router_chain"] = chain
+    svc_chain = []
+    if status == "file":
+        svc_chain, cross = expand_chain(cfg, payload.middlewares,
+                                        payload.where)
+        if cross is not None:
+            return None, ("service middleware %s references a non-file "
+                          "provider (out of scope)" % cross), []
+    detail["service_chain"] = svc_chain
+    # TLS mode annotation (TR17/TR18)
+    if kind == "tcp":
+        if router.tls is None:
+            detail["tls_mode"] = "none"
+        elif router.tls.get("passthrough"):
+            detail["tls_mode"] = "passthrough"
+            detail["banners"].append(
+                "[passthrough-cert-backend] TLS is passed through "
+                "untouched; whether the backend's certificate matches "
+                "the SNI is a backend fact")
+        else:
+            detail["tls_mode"] = "terminate"
+    else:
+        if router.tls is not None:
+            detail["tls_mode"] = "router-tls"
+        else:
+            detail["tls_mode"] = "none"
+    # path rewriting (TR22)
+    full_chain = chain + svc_chain
+    if isinstance(facts, HttpFacts):
+        final_path, steps = apply_rewrites(full_chain, facts.path)
+        detail["rewritten_path"] = final_path
+        detail["rewrite_steps"] = steps
+    else:
+        detail["rewritten_path"] = None
+        detail["rewrite_steps"] = []
+    # middleware outcome annotations
+    for mw in full_chain:
+        cls = classify_middleware(mw)
+        if mw.type in ("BasicAuth", "DigestAuth", "ForwardAuth"):
+            detail["banners"].append(
+                "[auth-may-reject] %s middleware %s may reject the "
+                "request (credentials not evaluated)" % (mw.type, mw.name))
+        if mw.type in ("RateLimit", "InFlightReq"):
+            detail["banners"].append(
+                "[rate-limit-runtime] %s middleware %s is "
+                "capacity-dependent (runtime)" % (mw.type, mw.name))
+        if mw.type == "CircuitBreaker":
+            detail["banners"].append(
+                "[circuit-breaker-runtime] CircuitBreaker %s is "
+                "health-dependent (runtime)" % mw.name)
+        if mw.type == "IPAllowList":
+            ranges = mw.config.get("sourceRange") or []
+            if facts.client_ip is not None and ranges:
+                nets = []
+                try:
+                    nets = [ipaddress.ip_network(str(x), strict=False)
+                            for x in ranges]
+                except ValueError:
+                    nets = []
+                if nets and _ip_in_networks(facts.client_ip,
+                                            nets) is FALSE:
+                    detail["banners"].append(
+                        "[ipallowlist-would-reject] client IP %s is "
+                        "outside IPAllowList %s sourceRange"
+                        % (facts.client_ip_raw, mw.name))
+        if mw.type in ("RedirectScheme", "RedirectRegex"):
+            detail["banners"].append(
+                "[redirect-middleware] %s middleware %s redirects the "
+                "client before the service is reached"
+                % (mw.type, mw.name))
+        if mw.type in V38_ONLY_MIDDLEWARES:
+            detail["banners"].append(
+                "[v3.8-only] middleware %s is type Tap (v3.8 feature)"
+                % mw.name)
+        if mw.type not in HTTP_BUILTIN_MIDDLEWARES and \
+                mw.type not in TCP_BUILTIN_MIDDLEWARES and \
+                mw.type not in V38_ONLY_MIDDLEWARES:
+            detail["banners"].append(
+                "[unknown-middleware-type] middleware %s (type %s) is "
+                "opaque; its effect is unknown" % (mw.name, mw.type))
+    # service banners propagate
+    if status == "file":
+        detail["banners"] += detail["service"]["banners"]
+        if not detail["service"]["has_servers"]:
+            detail["banners"].append(
+                "[service-has-no-servers] the live answer would be 503")
+    # default-cert annotation (TR18)
+    if kind == "http" and router.tls is not None:
+        has_cert = bool(cfg.tls_certs) or bool(cfg.static.has_tls_certs) \
+            or bool(router.tls.get("certResolver"))
+        if not has_cert:
+            detail["banners"].append(
+                "[default-cert-would-serve] winning TLS router has no "
+                "certificate source in the config; Traefik would serve "
+                "its default self-signed certificate")
+    if router.tls and router.tls.get("certResolver"):
+        detail["banners"].append(
+            "[acme-cert-runtime] certResolver %r: certificate issuance "
+            "state is runtime" % router.tls.get("certResolver"))
+    if router.tls and router.tls.get("options"):
+        opt = cfg.tls_options.get(router.tls["options"])
+        if opt and isinstance(opt.data.get("clientAuth"), dict):
+            detail["banners"].append(
+                "[client-auth-required] TLS options %s demand a client "
+                "certificate; the handshake may fail after routing"
+                % router.tls["options"])
+    # catch-all converting 404 to 503 (TR19)
+    if status == "file" and not detail["service"]["has_servers"]:
+        if router.rule and router.rule.strip() in (
+                "Host(`*`)", "HostSNI(`*`)"):
+            detail["banners"].append(
+                "[catchall-converts-404-to-503] catch-all router to a "
+                "serverless service converts 404s into 503s")
+    return detail, None, detail["banners"]
+
+
+def http_verdict(cfg, facts):
+    """The full http-verb walk (TR13/TR15/TR16/TR18/TR19/TR20/TR24)."""
+    coverage = _build_verdict_base(cfg, facts, "http")
+    redir = _redirect_check(cfg, facts)
+    if redir is not None:
+        return {"verdict": "REDIRECT", "exit": 0, "redirect": redir,
+                "router": None, "service": None, "match_chain": [],
+                "findings": list(cfg.findings) + list(
+                    cfg.duplicate_findings) + list(cfg.shadow_findings),
+                "coverage": coverage, "blockers": [], "tcp_gate": None}
+    evaluated = []
+    for r in cfg.http_routers.values():
+        if r.parent_refs or r.templated:
+            continue
+        val, reasons, flags = evaluate_router(r, facts, cfg)
+        evaluated.append({"router": r, "value": val, "reasons": reasons,
+                          "flags": flags})
+    evaluated.sort(key=lambda e: (-(e["router"].priority or 0),
+                                  e["router"].name))
+    # TCP-before-HTTP gate (TR16)
+    gate = _tcp_gate(cfg, facts)
+    if gate is not None:
+        blocker = {"router": gate["router"], "value": gate["value"],
+                   "reasons": ["[tcp-router-may-claim-connection] TCP "
+                               "router %s (%s) on this entrypoint may "
+                               "claim the connection before HTTP routers "
+                               "see it" % (gate["router"].name,
+                                            gate["router"].where)],
+                   "flags": []}
+        return {"verdict": "UNKNOWN", "exit": 2, "router": None,
+                "service": None, "match_chain": evaluated,
+                "findings": list(cfg.findings) + list(
+                    cfg.duplicate_findings) + list(cfg.shadow_findings),
+                "coverage": coverage, "blockers": [blocker],
+                "tcp_gate": blocker}
+    # multi-layer candidates (TR24)
+    ml = _multi_layer_candidates(cfg, facts, "http")
+    if ml:
+        blockers = [{"router": r, "value": UNKNOWN,
+                     "reasons": ["[multi-layer-routing] router %s (%s) "
+                                 "has parentRefs %s; its rule matches the "
+                                 "raw request but child routing depends on "
+                                 "parent middleware effects, which v1 does "
+                                 "not simulate" % (r.name, r.where,
+                                                   r.parent_refs)],
+                     "flags": []} for r in ml]
+        return {"verdict": "UNKNOWN", "exit": 2, "router": None,
+                "service": None, "match_chain": evaluated,
+                "findings": list(cfg.findings) + list(
+                    cfg.duplicate_findings) + list(cfg.shadow_findings),
+                "coverage": coverage, "blockers": blockers,
+                "tcp_gate": None}
+    status, winner, blockers = _resolve_tr13(evaluated, cfg)
+    if status == "unknown":
+        return {"verdict": "UNKNOWN", "exit": 2, "router": None,
+                "service": None, "match_chain": evaluated,
+                "findings": list(cfg.findings) + list(
+                    cfg.duplicate_findings) + list(cfg.shadow_findings),
+                "coverage": coverage, "blockers": blockers,
+                "tcp_gate": None}
+    if status == "no-match":
+        templated = [r for r in cfg.http_routers.values() if r.templated]
+        if templated:
+            blockers = [{"router": r, "value": UNKNOWN,
+                         "reasons": ["[go-template-not-evaluated] router "
+                                     "%s (%s) comes from a templated file; "
+                                     "it might have matched" % (r.name,
+                                                                 r.where)],
+                         "flags": []} for r in templated]
+            return {"verdict": "UNKNOWN", "exit": 2, "router": None,
+                    "service": None, "match_chain": evaluated,
+                    "findings": list(cfg.findings) + list(
+                        cfg.duplicate_findings) + list(cfg.shadow_findings),
+                    "coverage": coverage, "blockers": blockers,
+                    "tcp_gate": None}
+        return {"verdict": "NO-MATCH", "exit": 1, "router": None,
+                "service": None, "match_chain": evaluated,
+                "findings": list(cfg.findings) + list(
+                    cfg.duplicate_findings) + list(cfg.shadow_findings),
+                "coverage": coverage, "blockers": [],
+                "tcp_gate": None}
+    detail, cross, _b = _winner_detail(cfg, winner["router"], facts, "http")
+    if cross is not None:
+        blocker = {"router": winner["router"], "value": UNKNOWN,
+                   "reasons": ["[cross-provider-reference] " + cross],
+                   "flags": []}
+        return {"verdict": "UNKNOWN", "exit": 2, "router": None,
+                "service": None, "match_chain": evaluated,
+                "findings": list(cfg.findings) + list(
+                    cfg.duplicate_findings) + list(cfg.shadow_findings),
+                "coverage": coverage, "blockers": [blocker],
+                "tcp_gate": None}
+    return {"verdict": "MATCH", "exit": 0, "router": winner["router"],
+            "service": detail["service"], "detail": detail,
+            "match_chain": evaluated,
+            "findings": list(cfg.findings) + list(
+                cfg.duplicate_findings) + list(cfg.shadow_findings),
+            "coverage": coverage, "blockers": [], "tcp_gate": None}
+
+
+def tcp_verdict(cfg, facts):
+    """The tcp-verb walk (TR16/TR17/TR32). No HTTP consultation."""
+    coverage = _build_verdict_base(cfg, facts, "tcp")
+    evaluated = []
+    for r in cfg.tcp_routers.values():
+        if r.parent_refs or r.templated:
+            continue
+        val, reasons, flags = evaluate_router(r, facts, cfg)
+        evaluated.append({"router": r, "value": val, "reasons": reasons,
+                          "flags": flags})
+    evaluated.sort(key=lambda e: (-(e["router"].priority or 0),
+                                  e["router"].name))
+    ml = _multi_layer_candidates(cfg, facts, "tcp")
+    if ml:
+        blockers = [{"router": r, "value": UNKNOWN,
+                     "reasons": ["[multi-layer-routing] router %s (%s) "
+                                 "has parentRefs %s" % (r.name, r.where,
+                                                         r.parent_refs)],
+                     "flags": []} for r in ml]
+        return {"verdict": "UNKNOWN", "exit": 2, "router": None,
+                "service": None, "match_chain": evaluated,
+                "findings": list(cfg.findings) + list(
+                    cfg.duplicate_findings) + list(cfg.shadow_findings),
+                "coverage": coverage, "blockers": blockers,
+                "tcp_gate": None}
+    status, winner, blockers = _resolve_tr13(evaluated, cfg)
+    if status == "unknown":
+        return {"verdict": "UNKNOWN", "exit": 2, "router": None,
+                "service": None, "match_chain": evaluated,
+                "findings": list(cfg.findings) + list(
+                    cfg.duplicate_findings) + list(cfg.shadow_findings),
+                "coverage": coverage, "blockers": blockers,
+                "tcp_gate": None}
+    if status == "no-match":
+        templated = [r for r in cfg.tcp_routers.values() if r.templated]
+        if templated:
+            blockers = [{"router": r, "value": UNKNOWN,
+                         "reasons": ["[go-template-not-evaluated] router "
+                                     "%s (%s) comes from a templated file"
+                                     % (r.name, r.where)],
+                         "flags": []} for r in templated]
+            return {"verdict": "UNKNOWN", "exit": 2, "router": None,
+                    "service": None, "match_chain": evaluated,
+                    "findings": list(cfg.findings) + list(
+                        cfg.duplicate_findings) + list(cfg.shadow_findings),
+                    "coverage": coverage, "blockers": blockers,
+                    "tcp_gate": None}
+        note = None
+        if cfg.http_routers:
+            note = ("[http-routers-may-claim] no TCP router matched; "
+                    "HTTP routers may still claim the connection")
+        return {"verdict": "NO-MATCH", "exit": 1, "router": None,
+                "service": None, "match_chain": evaluated,
+                "findings": list(cfg.findings) + list(
+                    cfg.duplicate_findings) + list(cfg.shadow_findings)
+                + ([note] if note else []),
+                "coverage": coverage, "blockers": [],
+                "tcp_gate": None}
+    detail, cross, _b = _winner_detail(cfg, winner["router"], facts, "tcp")
+    if cross is not None:
+        blocker = {"router": winner["router"], "value": UNKNOWN,
+                   "reasons": ["[cross-provider-reference] " + cross],
+                   "flags": []}
+        return {"verdict": "UNKNOWN", "exit": 2, "router": None,
+                "service": None, "match_chain": evaluated,
+                "findings": list(cfg.findings) + list(
+                    cfg.duplicate_findings) + list(cfg.shadow_findings),
+                "coverage": coverage, "blockers": [blocker],
+                "tcp_gate": None}
+    return {"verdict": "MATCH", "exit": 0, "router": winner["router"],
+            "service": detail["service"], "detail": detail,
+            "match_chain": evaluated,
+            "findings": list(cfg.findings) + list(
+                cfg.duplicate_findings) + list(cfg.shadow_findings),
+            "coverage": coverage, "blockers": [], "tcp_gate": None}
+
+# ---------------------------------------------------------------- render
+
+def _router_label(router):
+    if router.is_internal:
+        return "%s@internal" % router.name
+    return "%s@file" % router.name
+
+
+def _value_word(value):
+    if value is TRUE:
+        return "TRUE"
+    if value is FALSE:
+        return "FALSE"
+    return "UNKNOWN"
+
+
+def _middleware_line(mw, chain_kind):
+    return "    %s %s (%s) %s [%s]" % (
+        chain_kind, mw.name, mw.type, mw.where, classify_middleware(mw))
+
+
+def render_text(verdict, cfg, facts, quiet):
+    out = []
+    v = verdict["verdict"]
+    if v == "REDIRECT":
+        r = verdict["redirect"]
+        out.append("VERDICT REDIRECT — entrypoint %s redirects to %s "
+                   "(scheme %s, HTTP %d); no router evaluated"
+                   % (r["entrypoint"], r["target"], r["scheme"],
+                      r["status"]))
+    elif v == "MATCH":
+        router = verdict["router"]
+        detail = verdict["detail"]
+        svc = verdict["service"]
+        out.append("VERDICT MATCH — router %s %s (priority %d) → "
+                   "service %s"
+                   % (_router_label(router), router.where,
+                      router.priority,
+                      "%s@%s" % (svc["name"],
+                                  svc.get("provider", "file"))))
+        out.append("  rule: %s" % router.rule)
+        if isinstance(facts, HttpFacts) and facts.path_raw != facts.path:
+            out.append("  path %s (normalized from %s)"
+                       % (facts.path, facts.path_raw))
+        if router.tls is not None and router.kind == "http":
+            out.append("  tls: router-tls (HTTPS-only)")
+        elif router.kind == "tcp":
+            out.append("  tls=%s" % detail["tls_mode"])
+        else:
+            out.append("  tls: none")
+        if svc["type"] == "internal":
+            out.append("  service: %s@internal (Traefik internal service)"
+                       % svc["name"])
+        elif svc["type"] == "loadBalancer":
+            servers = ", ".join(svc["servers"]) if svc["servers"] \
+                else "(no servers)"
+            out.append("  service: %s@file (loadBalancer) — servers: %s"
+                       % (svc["name"], servers))
+        elif svc["type"] == "weighted":
+            members = ", ".join(
+                "%s (weight %s)" % (m["ref"], m["weight"])
+                for m in svc["members"])
+            out.append("  service: %s@file (weighted) — members: %s"
+                       % (svc["name"], members))
+        elif svc["type"] == "mirroring":
+            members = ", ".join(
+                "%s%s" % (m["ref"],
+                          (" (mirror, %s%%)" % m["percent"])
+                          if m.get("role") == "mirror" else " (main)")
+                for m in svc["members"])
+            out.append("  service: %s@file (mirroring) — %s"
+                       % (svc["name"], members))
+        elif svc["type"] == "failover":
+            members = ", ".join(
+                "%s (%s)" % (m["ref"], m["role"]) for m in svc["members"])
+            out.append("  service: %s@file (failover) — %s"
+                       % (svc["name"], members))
+        if svc.get("effective"):
+            out.append("  effective service: %s" % svc["effective"])
+        if detail["router_chain"] or detail["service_chain"]:
+            out.append("  middlewares:")
+            for mw in detail["router_chain"]:
+                out.append(_middleware_line(mw, "router:"))
+            for mw in detail["service_chain"]:
+                out.append(_middleware_line(mw, "service:"))
+            if detail["rewrite_steps"]:
+                for mw, old, new in detail["rewrite_steps"]:
+                    out.append("    path rewrite: %s %s → %s"
+                               % (mw.name, old, new))
+                out.append("  service sees path: %s"
+                           % detail["rewritten_path"])
+        for banner in detail["banners"]:
+            out.append("  %s" % banner)
+    elif v == "NO-MATCH":
+        out.append("VERDICT NO-MATCH — no router matched (live answer: "
+                   "404 Not Found)")
+    else:  # UNKNOWN
+        out.append("VERDICT UNKNOWN — the answer is not statically "
+                   "decidable")
+        for b in verdict["blockers"]:
+            r = b["router"]
+            out.append("  blocker: %s (%s) — %s"
+                       % (r.name, r.where, "; ".join(b["reasons"])))
+            if b.get("flags"):
+                out.append("    resolve with: %s"
+                           % ", ".join(b["flags"]))
+    if quiet:
+        return "\n".join(out[:1]) + "\n"
+    if verdict["match_chain"]:
+        out.append("  match chain (priority order):")
+        for e in verdict["match_chain"]:
+            r = e["router"]
+            prio = r.priority if r.priority is not None else "?"
+            out.append("    %s %s %s (priority %s) — %s"
+                       % (_value_word(e["value"]), _router_label(r),
+                          r.where, prio, "; ".join(e["reasons"])))
+    if verdict["findings"]:
+        out.append("  findings:")
+        for f in verdict["findings"]:
+            out.append("    %s" % f)
+    cov = verdict["coverage"]
+    out.append("  coverage:")
+    out.append("    provider: file only "
+               "[file-provider-only]")
+    if cov["static_supplied"]:
+        out.append("    static config: %s" % cov["static_file"])
+    else:
+        out.append("    static config: not supplied "
+                   "[static-config-not-supplied] — entrypoint TLS, "
+                   "redirections, defaultRuleSyntax, and other-provider "
+                   "detection are unknown")
+    out.append("    files read: %s"
+               % (", ".join(cov["files_read"]) or "(none)"))
+    for ign in cov["files_ignored"]:
+        out.append("    ignored: %s (%s)" % (ign["path"], ign["reason"]))
+    out.append("    inventoried: %d routers (%d http, %d tcp, %d udp), "
+               "%d services, %d middlewares, %d tls.options"
+               % (cov["routers"], cov["http_routers"], cov["tcp_routers"],
+                  cov["udp_routers"], cov["services"], cov["middlewares"],
+                  cov["tls_options"]))
+    if cfg.static.file and not cfg.static.entrypoints:
+        out.append("    entrypoints: none defined in static config "
+                   "[entrypoint-properties-unknown]")
+    elif cfg.static.file:
+        out.append("    entrypoints: %s"
+                   % ", ".join(sorted(cfg.static.entrypoints)))
+    else:
+        out.append("    entrypoints: unknown (no --static) "
+                   "[entrypoint-properties-unknown]")
+    if isinstance(facts, HttpFacts) and facts.path_raw != facts.path:
+        out.append("    note: path normalized %s → %s"
+                   % (facts.path_raw, facts.path))
+    out.append("    pinned Traefik: v%s stable (v3.8-only fields flagged, "
+               "not modelled)" % PINNED_TRAEFIK)
+    return "\n".join(out) + "\n"
+
+
+def _router_json(router):
+    return {"name": router.name,
+            "provider": "internal" if router.is_internal else "file",
+            "file": router.file, "line": router.line,
+            "kind": router.kind, "rule": router.rule,
+            "priority": router.priority,
+            "explicit_priority": router.explicit_priority,
+            "entrypoints": router.entrypoints,
+            "service": router.service_ref,
+            "middlewares": list(router.middleware_refs),
+            "tls": bool(router.tls is not None),
+            "tls_mode": ("passthrough"
+                         if router.tls and router.tls.get("passthrough")
+                         else ("terminate" if router.tls else "none"))
+            if router.kind == "tcp" else None,
+            "parentRefs": router.parent_refs,
+            "syntax": router.syntax}
+
+
+def _service_json(svc):
+    if svc is None:
+        return None
+    out = {"name": svc["name"], "kind": svc.get("kind"),
+           "provider": svc.get("provider", "file"),
+           "type": svc["type"], "servers": svc["servers"],
+           "members": svc["members"], "has_servers": svc["has_servers"],
+           "effective": svc.get("effective"), "banners": svc["banners"]}
+    if svc.get("file"):
+        out["file"] = svc["file"]
+        out["line"] = svc["line"]
+    return out
+
+
+def render_json(verdict, cfg, facts):
+    doc = {"tool": PROG, "version": VERSION,
+           "pinned_traefik": PINNED_TRAEFIK,
+           "verdict": verdict["verdict"], "exit_code": verdict["exit"]}
+    if verdict["verdict"] == "REDIRECT":
+        doc["redirect"] = verdict["redirect"]
+    if verdict["router"] is not None:
+        doc["router"] = _router_json(verdict["router"])
+        detail = verdict["detail"]
+        doc["service"] = _service_json(verdict["service"])
+        doc["middlewares"] = {
+            "router": [{"name": m.name, "type": m.type, "file": m.file,
+                        "line": m.line, "class": classify_middleware(m)}
+                       for m in detail["router_chain"]],
+            "service": [{"name": m.name, "type": m.type, "file": m.file,
+                         "line": m.line, "class": classify_middleware(m)}
+                        for m in detail["service_chain"]],
+        }
+        doc["rewritten_path"] = detail["rewritten_path"]
+        doc["rewrite_steps"] = [
+            {"middleware": m.name, "from": old, "to": new}
+            for m, old, new in detail["rewrite_steps"]]
+        doc["tls_mode"] = detail["tls_mode"]
+        doc["banners"] = detail["banners"]
+    doc["match_chain"] = [
+        {"router": e["router"].name,
+         "provider": "internal" if e["router"].is_internal else "file",
+         "kind": e["router"].kind, "file": e["router"].file,
+         "line": e["router"].line, "priority": e["router"].priority,
+         "value": _value_word(e["value"]), "reasons": e["reasons"],
+         "flags": e["flags"]} for e in verdict["match_chain"]]
+    doc["blockers"] = [
+        {"router": b["router"].name, "file": b["router"].file,
+         "line": b["router"].line, "reasons": b["reasons"],
+         "flags": b.get("flags", [])} for b in verdict["blockers"]]
+    doc["findings"] = verdict["findings"]
+    doc["coverage"] = verdict["coverage"]
+    return json.dumps(doc, indent=2) + "\n"
+
+
+# ---------------------------------------------------------------- inventory
+
+def list_routers(cfg, kind, quiet):
+    rows = []
+    for r in cfg.all_routers():
+        if kind != "all" and r.kind != kind:
+            continue
+        rows.append(r)
+    rows.sort(key=lambda r: (r.kind, r.name))
+    if quiet:
+        return "\n".join(_router_label(r) for r in rows) + ("\n" if rows else "")
+    out = []
+    for r in rows:
+        prio = r.priority if r.priority is not None else "?"
+        line = "%s %s %s (priority %s" % (
+            r.kind, _router_label(r), r.where, prio)
+        if r.explicit_priority not in (None, 0):
+            line += ", explicit %d" % r.explicit_priority
+        line += ")"
+        if r.rule:
+            line += " rule: %s" % r.rule
+        else:
+            line += " [udp-no-rule]"
+        if r.entrypoints:
+            line += " entrypoints: %s" % ",".join(r.entrypoints)
+        if r.service_ref:
+            line += " service: %s" % r.service_ref
+        if r.middleware_refs:
+            line += " middlewares: %s" % ",".join(r.middleware_refs)
+        if r.tls is not None:
+            line += " tls: %s" % (
+                "passthrough" if r.tls.get("passthrough") else "terminate")
+        if r.parent_refs:
+            line += " parentRefs: %s [multi-layer-router-excluded]" % \
+                ",".join(r.parent_refs)
+        if r.syntax == "v2":
+            line += " [v2-rule-syntax-deprecated]"
+        if r.templated:
+            line += " [go-template-not-evaluated]"
+        out.append(line)
+    if not out:
+        out.append("(no routers)")
+    return "\n".join(out) + "\n"
+
+
+def list_services(cfg, kind, quiet):
+    rows = []
+    for (k, _name), s in sorted(cfg.services.items()):
+        if kind and k != kind:
+            continue
+        rows.append(s)
+    if quiet:
+        return "\n".join("%s/%s" % (s.kind, s.name) for s in rows) + \
+            ("\n" if rows else "")
+    out = []
+    for s in rows:
+        rep = service_servers(cfg, s)
+        if s.type == "loadBalancer":
+            detail = "servers: %s" % (
+                ", ".join(rep["servers"]) if rep["servers"] else "(none)")
+        else:
+            detail = "members: %s" % ", ".join(
+                str(m["ref"]) for m in rep["members"])
+        line = "%s %s@file %s (%s) — %s" % (
+            s.kind, s.name, s.where, s.type, detail)
+        if s.middlewares:
+            line += " middlewares: %s" % ",".join(s.middlewares)
+        if s.templated:
+            line += " [go-template-not-evaluated]"
+        out.append(line)
+    if not out:
+        out.append("(no services)")
+    return "\n".join(out) + "\n"
+
+
+def list_middlewares(cfg, quiet):
+    counts = {}
+    for r in cfg.all_routers():
+        for ref in r.middleware_refs:
+            name, _p = split_provider_ref(ref, r.where, "middleware")
+            counts.setdefault(name, {"routers": [], "services": []})
+            counts[name]["routers"].append(r.name)
+    for s in cfg.services.values():
+        for ref in s.middlewares:
+            name, _p = split_provider_ref(ref, s.where, "middleware")
+            counts.setdefault(name, {"routers": [], "services": []})
+            counts[name]["services"].append(s.name)
+    # chains reference middlewares too
+    for m in cfg.middlewares.values():
+        if m.type == "Chain":
+            for ref in _as_list(m.config.get("middlewares"), m.where,
+                                "chain middlewares"):
+                name, _p = split_provider_ref(ref, m.where, "middleware")
+                counts.setdefault(name, {"routers": [], "services": []})
+    rows = sorted(cfg.middlewares.values(), key=lambda m: m.name)
+    if quiet:
+        return "\n".join(m.name for m in rows) + ("\n" if rows else "")
+    out = []
+    for m in rows:
+        c = counts.get(m.name, {"routers": [], "services": []})
+        refs = []
+        if c["routers"]:
+            refs.append("routers: %s" % ",".join(sorted(set(c["routers"]))))
+        if c["services"]:
+            refs.append("services: %s" % ",".join(sorted(set(c["services"]))))
+        line = "%s %s (%s) — %s" % (
+            m.name, m.where, m.type,
+            "; ".join(refs) if refs else "unreferenced")
+        if m.type in V38_ONLY_MIDDLEWARES:
+            line += " [v3.8-only]"
+        elif m.type not in HTTP_BUILTIN_MIDDLEWARES and \
+                m.type not in TCP_BUILTIN_MIDDLEWARES:
+            line += " [unknown-middleware-type]"
+        out.append(line)
+    if not out:
+        out.append("(no middlewares)")
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------- CLI
+
+HELP = """traefikwho {version} — which Traefik router handles this request?
+
+Usage:
+  traefikwho http --host HOST [--path PATH] [--method METHOD]
+      [--header K=V]... [--query K=V]... [--client-ip IP]
+      [--entrypoint NAME] [--tls | --no-tls]
+      [--conf DIR] [--static FILE] [--json] [--quiet]
+  traefikwho tcp [--sni NAME] [--alpn PROTO] [--client-ip IP]
+      [--entrypoint NAME] [--tls | --no-tls]
+      [--conf DIR] [--static FILE] [--json] [--quiet]
+  traefikwho --list-routers [--kind http|tcp|all] [--conf DIR]
+  traefikwho --list-services [--kind http|tcp] [--conf DIR]
+  traefikwho --list-middlewares [--conf DIR]
+  traefikwho --version
+  traefikwho --help
+
+--conf is required (no default: Traefik configs live in too many
+places to guess). It names the file-provider dynamic directory (or a
+single dynamic file). --static names the static config file
+(traefik.yml); if omitted, a file literally named traefik.yml /
+traefik.yaml / traefik.toml at the top of --conf is read as the
+static file instead. No auto-discovery of /etc/traefik.
+
+A request field the flags cannot express is UNKNOWN, not absent:
+omit --method and a Method(...) term is UNKNOWN, not FALSE. The
+verdict names the flag that would resolve it.
+
+Verdicts and exit codes: MATCH 0, REDIRECT 0, NO-MATCH 1 (live
+answer: 404), UNKNOWN 2, config-fatal 2, usage error 2.
+
+Semantics pinned to Traefik v3.7 stable (see README.md). The file
+provider is the only provider read; Docker/Kubernetes/Consul/etc.
+routers are invisible and bannered, never approximated.
+"""
+
+
+def _parse_kv(flag, value, what):
+    if "=" not in value:
+        raise UsageError("%s %r must be K=V" % (flag, value))
+    key, val = value.split("=", 1)
+    if not key:
+        raise UsageError("%s %r must be K=V" % (flag, value))
+    return key, val
+
+
+def _parse_flags(args, spec):
+    """Hand-rolled flag parser. spec: {flag: (kind, dest)} where kind
+    is 'bool', 'value', 'multi', 'kv'. Returns (opts, errors)."""
+    opts = {"headers": {}, "query": {}}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg not in spec:
+            raise UsageError("unknown flag %r" % arg)
+        kind, dest = spec[arg]
+        if kind == "bool":
+            opts[dest] = True
+            i += 1
+        else:
+            if i + 1 >= len(args):
+                raise UsageError("flag %s needs a value" % arg)
+            val = args[i + 1]
+            i += 2
+            if kind == "value":
+                if dest in opts and opts[dest] is not None:
+                    raise UsageError("flag %s given twice" % arg)
+                opts[dest] = val
+            elif kind == "multi":
+                opts.setdefault(dest, []).append(val)
+            elif kind == "kv":
+                key, v = _parse_kv(arg, val, dest)
+                opts[dest].setdefault(key, []).append(v)
+    return opts
+
+
+_COMMON_SPEC = {
+    "--conf": ("value", "conf"),
+    "--static": ("value", "static"),
+    "--json": ("bool", "json"),
+    "--quiet": ("bool", "quiet"),
+    "--version": ("bool", "version"),
+    "--help": ("bool", "help"),
+    "-h": ("bool", "help"),
+}
+
+_HTTP_SPEC = dict(_COMMON_SPEC)
+_HTTP_SPEC.update({
+    "--host": ("value", "host"),
+    "--path": ("value", "path"),
+    "--method": ("value", "method"),
+    "--header": ("kv", "headers"),
+    "--query": ("kv", "query"),
+    "--client-ip": ("value", "client_ip"),
+    "--entrypoint": ("value", "entrypoint"),
+    "--tls": ("bool", "tls"),
+    "--no-tls": ("bool", "no_tls"),
+})
+
+_TCP_SPEC = dict(_COMMON_SPEC)
+_TCP_SPEC.update({
+    "--sni": ("value", "sni"),
+    "--alpn": ("value", "alpn"),
+    "--client-ip": ("value", "client_ip"),
+    "--entrypoint": ("value", "entrypoint"),
+    "--tls": ("bool", "tls"),
+    "--no-tls": ("bool", "no_tls"),
+})
+
+_LIST_SPEC = dict(_COMMON_SPEC)
+_LIST_SPEC.update({
+    "--list-routers": ("bool", "list_routers"),
+    "--list-services": ("bool", "list_services"),
+    "--list-middlewares": ("bool", "list_middlewares"),
+    "--kind": ("value", "kind"),
+})
+
+
+def _check_version_help(opts):
+    if opts.get("version"):
+        print("%s %s" % (PROG, VERSION))
+        return 0
+    if opts.get("help"):
+        print(HELP.format(version=VERSION), end="")
+        return 0
+    return None
+
+
+def _need_conf(opts):
+    conf = opts.get("conf")
+    if not conf:
+        raise UsageError("--conf is required (no default: Traefik "
+                         "configs live in too many places to guess)")
+    return conf
+
+
+def _load_or_fatal(conf, static):
+    findings = []
+    try:
+        return load_config(conf, static, findings)
+    except ConfigFatal as exc:
+        where = (" at %s" % exc.where) if exc.where else ""
+        print("config error: %s%s" % (exc.message, where), file=sys.stderr)
+        return None
+
+
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    try:
+        if not args:
+            print(HELP.format(version=VERSION), end="")
+            return 2
+        first = args[0]
+        if first in ("--help", "-h"):
+            print(HELP.format(version=VERSION), end="")
+            return 0
+        if first == "--version":
+            print("%s %s" % (PROG, VERSION))
+            return 0
+        if first in ("http", "tcp"):
+            spec = _HTTP_SPEC if first == "http" else _TCP_SPEC
+            opts = _parse_flags(args[1:], spec)
+            done = _check_version_help(opts)
+            if done is not None:
+                return done
+            if opts.get("tls") and opts.get("no_tls"):
+                raise UsageError("--tls and --no-tls are mutually "
+                                 "exclusive")
+            conf = _need_conf(opts)
+            cfg = _load_or_fatal(conf, opts.get("static"))
+            if cfg is None:
+                return 2
+            tls = True if opts.get("tls") else (
+                False if opts.get("no_tls") else None)
+            if first == "http":
+                facts = HttpFacts(
+                    host=opts.get("host"),
+                    path=opts.get("path", "/"),
+                    method=opts.get("method"),
+                    headers=opts.get("headers"),
+                    query=opts.get("query"),
+                    client_ip=opts.get("client_ip"),
+                    entrypoint=opts.get("entrypoint"), tls=tls)
+                verdict = http_verdict(cfg, facts)
+            else:
+                facts = TcpFacts(
+                    sni=opts.get("sni"), alpn=opts.get("alpn"),
+                    client_ip=opts.get("client_ip"),
+                    entrypoint=opts.get("entrypoint"), tls=tls)
+                verdict = tcp_verdict(cfg, facts)
+            if opts.get("json"):
+                sys.stdout.write(render_json(verdict, cfg, facts))
+            else:
+                sys.stdout.write(render_text(
+                    verdict, cfg, facts, bool(opts.get("quiet"))))
+            return verdict["exit"]
+        if first.startswith("--list-") or first in (
+                "--kind", "--conf", "--static", "--json", "--quiet",
+                "--version"):
+            opts = _parse_flags(args, _LIST_SPEC)
+            done = _check_version_help(opts)
+            if done is not None:
+                return done
+            modes = [m for m in ("list_routers", "list_services",
+                                 "list_middlewares") if opts.get(m)]
+            if len(modes) != 1:
+                raise UsageError("exactly one of --list-routers, "
+                                 "--list-services, --list-middlewares is "
+                                 "required")
+            conf = _need_conf(opts)
+            cfg = _load_or_fatal(conf, opts.get("static"))
+            if cfg is None:
+                return 2
+            kind = opts.get("kind")
+            quiet = bool(opts.get("quiet"))
+            if modes[0] == "list_routers":
+                if kind is None:
+                    kind = "all"
+                if kind not in ("http", "tcp", "all"):
+                    raise UsageError("--kind for --list-routers must be "
+                                     "http, tcp, or all")
+                sys.stdout.write(list_routers(cfg, kind, quiet))
+            elif modes[0] == "list_services":
+                if kind is not None and kind not in ("http", "tcp"):
+                    raise UsageError("--kind for --list-services must be "
+                                     "http or tcp")
+                sys.stdout.write(list_services(cfg, kind, quiet))
+            else:
+                if kind is not None:
+                    raise UsageError("--kind does not apply to "
+                                     "--list-middlewares")
+                sys.stdout.write(list_middlewares(cfg, quiet))
+            return 0
+        if first.startswith("--"):
+            raise UsageError("unknown flag %r" % first)
+        raise UsageError("unknown verb %r (expected http, tcp, "
+                         "--list-routers, --list-services, "
+                         "--list-middlewares, --version, --help)" % first)
+    except UsageError as exc:
+        print("usage error: %s" % exc, file=sys.stderr)
+        print("usage: traefikwho http|tcp ... | --list-routers | "
+              "--list-services | --list-middlewares | --version | --help",
+              file=sys.stderr)
+        return 2
+    except ConfigFatal as exc:
+        where = (" at %s" % exc.where) if exc.where else ""
+        print("config error: %s%s" % (exc.message, where), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
