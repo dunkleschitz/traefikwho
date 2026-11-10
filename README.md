@@ -268,12 +268,12 @@ documentation text is the only authority.
       green under umask 022
 - [x] Design review BUILD APPROVED (DESIGN-traefikwho.md, 2026-11-10)
 - [x] Publish approved by Sam Nov 10, 2026 ("Concur on all projects")
-- [ ] `doccover` clean over README vs `--help`
-- [ ] `clicheck` (strict mode) clean
-- [ ] `prepublish-check` clean (stdlib-only, no secret-like literals)
-- [ ] `bench-audit` clean (map entry added for traefikwho)
-- [ ] MIT LICENSE, copyright holder `dunkleschitz`
-- [ ] CI workflow `.github/workflows/tests.yml` (Python 3.12,
+- [x] `doccover` clean over README vs `--help` (20/20, 0 gaps, 0 stale)
+- [x] `clicheck` (strict mode) clean (16/16)
+- [x] `prepublish-check` clean (stdlib-only, no secret-like literals)
+- [x] `bench-audit` clean (map entry added for traefikwho)
+- [x] MIT LICENSE, copyright holder `dunkleschitz`
+- [x] CI workflow `.github/workflows/tests.yml` (Python 3.12,
       runs `python3 test_traefikwho.py`)
 
 ## License
